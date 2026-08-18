@@ -1,6 +1,6 @@
 /** Proves Twilio call openers atomically retain their first continuity snapshot. */
 
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -35,7 +35,7 @@ const claimOpeningContextSql = `
     opening_previous_interaction_at
 `;
 
-describe("0246 Twilio call opening context", () => {
+describe("0269 Twilio call opening context", () => {
   const databases: PGlite[] = [];
 
   afterEach(async () => {
@@ -46,6 +46,34 @@ describe("0246 Twilio call opening context", () => {
     expect(
       getTableConfig(twilioInboundCalls).checks.map((constraint) => constraint.name),
     ).toContain("twilio_inbound_calls_opening_context_shape_check");
+  });
+
+  it("appends after applied history with a unique journal index and filename", async () => {
+    const migrationsUrl = new URL("./migrations/", import.meta.url);
+    const journal = JSON.parse(
+      await readFile(new URL("meta/_journal.json", migrationsUrl), "utf8"),
+    ) as { entries: Array<{ idx: number; tag: string }> };
+    const filenames = await readdir(migrationsUrl);
+    const entry = journal.entries.at(-1);
+
+    expect(entry).toEqual({
+      idx: 268,
+      version: "7",
+      when: 1792699200000,
+      tag: "0269_twilio_call_opening_context",
+      breakpoints: true,
+    });
+    expect(new Set(journal.entries.map(({ idx }) => idx)).size).toBe(journal.entries.length);
+    expect(new Set(journal.entries.map(({ tag }) => tag)).size).toBe(journal.entries.length);
+    expect(filenames.filter((filename) => filename.startsWith("0269_"))).toEqual([
+      "0269_twilio_call_opening_context.sql",
+    ]);
+    expect(filenames).toContain("0253_job_retryable_requeues.sql");
+    expect(filenames).not.toContain("0253_twilio_call_opening_context.sql");
+    expect(filenames).not.toContain("0246_twilio_call_opening_context.sql");
+    expect(
+      filenames.filter((filename) => filename.endsWith("_twilio_call_opening_context.sql")),
+    ).toEqual(["0269_twilio_call_opening_context.sql"]);
   });
 
   it("claims one snapshot and preserves it across delayed prior history", async () => {
