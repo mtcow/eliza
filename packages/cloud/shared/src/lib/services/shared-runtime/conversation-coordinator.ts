@@ -30,6 +30,10 @@ export interface SharedConversationCoordinatorOptions {
   agentKind?: "sandbox" | "personal";
   /** Authenticated server-only role override; never accepted from RPC params. */
   trustedMessageRole?: "system";
+  /** Authenticated epoch-ms history ceiling; never accepted from RPC params. */
+  trustedHistoryCutoffAt?: number;
+  /** Authenticated control input is excluded from durable conversation history. */
+  transientInput?: true;
   /** Authenticated raw utterance when RPC text also contains server-composed context. */
   trustedUserUtterance?: string;
   /** Authenticated transport semantics; never accepted from bridge RPC params. */
@@ -298,6 +302,10 @@ export async function coordinateSharedBridge(
         rpc,
         ...(options.traceId ? { traceId: options.traceId } : {}),
         ...(options.trustedMessageRole ? { trustedMessageRole: options.trustedMessageRole } : {}),
+        ...(options.trustedHistoryCutoffAt !== undefined
+          ? { trustedHistoryCutoffAt: options.trustedHistoryCutoffAt }
+          : {}),
+        ...(options.transientInput ? { transientInput: true } : {}),
         ...(options.trustedUserUtterance
           ? { trustedUserUtterance: options.trustedUserUtterance }
           : {}),
@@ -325,6 +333,10 @@ export async function coordinateSharedStream(
         rpc,
         ...(options.traceId ? { traceId: options.traceId } : {}),
         ...(options.trustedMessageRole ? { trustedMessageRole: options.trustedMessageRole } : {}),
+        ...(options.trustedHistoryCutoffAt !== undefined
+          ? { trustedHistoryCutoffAt: options.trustedHistoryCutoffAt }
+          : {}),
+        ...(options.transientInput ? { transientInput: true } : {}),
         ...(options.trustedUserUtterance
           ? { trustedUserUtterance: options.trustedUserUtterance }
           : {}),
