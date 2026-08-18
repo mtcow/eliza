@@ -65,6 +65,10 @@ import {
   SHARED_RUNTIME_CAPABILITIES_PROVIDER,
 } from "./shared-runtime-capabilities";
 import {
+  sharedPublicWebGrounding,
+  sharedRuntimeModelHistoryMessages,
+} from "./shared-runtime-history-policy";
+import {
   sharedRuntimeConversationRoomId,
   sharedRuntimeWorldId,
 } from "./shared-runtime-storage-identity";
@@ -550,6 +554,10 @@ async function executeMeasuredSharedElizaRuntimeTurn(
   const inferenceTelemetry: { summary?: InferenceTurnSummary } = {};
   let usage: SharedAgentTurnUsage | undefined;
   const model = getInteractiveCerebrasLanguageModel(input.model);
+  const persistedGroundingMessages = sharedRuntimeModelHistoryMessages(
+    input.history,
+    input.message,
+  ).filter((message) => typeof message.content !== "string");
 
   const modelHandler = async (
     _runtime: IAgentRuntime,
@@ -565,7 +573,13 @@ async function executeMeasuredSharedElizaRuntimeTurn(
       maxRetries: SHARED_TURN_MAX_RETRIES,
       allowSystemInMessages: true,
       ...(params.messages
-        ? { messages: params.messages as ModelMessage[] }
+        ? {
+            messages: [
+              ...(params.messages as ModelMessage[]).slice(0, -1),
+              ...persistedGroundingMessages,
+              ...(params.messages as ModelMessage[]).slice(-1),
+            ],
+          }
         : { prompt: params.prompt ?? "" }),
       ...(params.tools ? { tools: modelTools(params.tools) } : {}),
       ...(params.toolChoice ? { toolChoice: modelToolChoice(params.toolChoice) } : {}),
@@ -918,6 +932,7 @@ async function executeMeasuredSharedElizaRuntimeTurn(
         reply,
         input.messageIds,
         input.messageRole,
+        sharedPublicWebGrounding(result.actionResults),
       ),
       model: input.model,
       degraded: false,
