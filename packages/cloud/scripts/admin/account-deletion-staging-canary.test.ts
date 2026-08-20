@@ -161,6 +161,9 @@ describe("account deletion staging canary", () => {
     );
     expect(source).toContain("members.rows.length !== 1");
     expect(source).toContain("cloud_cleanup_scope_mismatch");
+    expect(
+      source.match(/DELETE FROM organizations WHERE id = \$1 RETURNING id/g),
+    ).toHaveLength(2);
     expect(source).toContain("await steward.assertTenantAbsent(tenantId)");
     expect(source).toContain("await database.assertStewardIdentityAbsent");
     expect(source).toContain("await database.assertCloudEmailAbsent");

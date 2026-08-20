@@ -1044,6 +1044,10 @@ class CanaryDatabase {
         [identity.organizationId],
       );
       if (members.rows.length === 0) {
+        await this.client.query(
+          "DELETE FROM organizations WHERE id = $1 RETURNING id",
+          [identity.organizationId],
+        );
         await this.client.query("COMMIT");
         return;
       }
