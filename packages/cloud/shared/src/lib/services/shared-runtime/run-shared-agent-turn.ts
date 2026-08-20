@@ -41,7 +41,10 @@ import {
 } from "./shared-capability-wall";
 import type { SharedMemoryStore } from "./shared-memory-store";
 import type { SharedRuntimeChannel } from "./shared-runtime-channel";
-import type { SharedRuntimeTimingReceipt } from "./shared-runtime-timing";
+import type {
+  SharedProviderTimingReceipt,
+  SharedRuntimeTimingReceipt,
+} from "./shared-runtime-timing";
 
 export type { SharedRuntimeChannel } from "./shared-runtime-channel";
 export {
@@ -191,6 +194,8 @@ export interface RunSharedAgentTurnResult {
   actionResults?: ActionResult[];
   /** Typed refusal for a tool or device action Shared cannot execute. */
   capabilityWall?: SharedCapabilityWall;
+  /** Privacy-bounded provider timing exposed to Shared transports. */
+  timing?: SharedProviderTimingReceipt;
   /** Unsupported clauses that follow an enabled primary reminder or Todo. */
   blockedSecondaryCapabilities?: SharedCapabilityWall[];
 }
@@ -204,6 +209,8 @@ export type SharedAgentTurnStreamPart =
       usage?: SharedAgentTurnUsage;
       /** Applied plugin effects that must land with the terminal turn. */
       actionResults?: ActionResult[];
+      /** Privacy-bounded provider timing exposed on the terminal stream frame. */
+      timing?: SharedProviderTimingReceipt;
     };
 
 export interface RunSharedAgentTurnStreamResult {
