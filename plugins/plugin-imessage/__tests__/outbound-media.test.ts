@@ -140,10 +140,11 @@ describe("iMessage service — media → AppleScript attachment build", () => {
       emitEvent: vi.fn(),
     } as unknown as IAgentRuntime;
     const svc = new IMessageService(runtime);
-    // Inject the runtime + minimal settings (AppleScript path: cliPath "imsg").
+    // Inject the runtime + minimal settings. A legacy custom CLI path must not
+    // change the native Messages transport selected by this connector.
     (svc as unknown as { runtime: IAgentRuntime }).runtime = runtime;
     (svc as unknown as { settings: unknown }).settings = {
-      cliPath: "imsg",
+      cliPath: "/tmp/legacy-imsg-must-not-run",
       pollIntervalMs: 0,
       dmPolicy: "open",
       groupPolicy: "open",
@@ -172,6 +173,17 @@ describe("iMessage service — media → AppleScript attachment build", () => {
     const attachmentScript = scripts.find((s) => s.includes("POSIX file"));
     expect(attachmentScript).toBeDefined();
     expect(attachmentScript).toContain("/Users/me/Library/media/clip.mp3");
+  });
+
+  it("ignores a legacy IMESSAGE_CLI_PATH and stays on AppleScript", async () => {
+    const { svc, scripts } = makeService();
+
+    const result = await svc.sendMessage("+14155552671", "native only");
+
+    expect(result.success).toBe(true);
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]).toContain('tell application "Messages"');
+    expect(scripts[0]).toContain("native only");
   });
 
   it("normalises a file:// media URL to a POSIX path", async () => {

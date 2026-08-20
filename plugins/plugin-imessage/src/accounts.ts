@@ -43,7 +43,7 @@ export interface IMessageAccountConfig {
   name?: string;
   /** If false, do not start this iMessage account */
   enabled?: boolean;
-  /** Path to the iMessage CLI tool */
+  /** Deprecated compatibility field; native delivery ignores it. */
   cliPath?: string;
   /** Path to the iMessage database */
   dbPath?: string;

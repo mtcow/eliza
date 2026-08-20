@@ -3,7 +3,6 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { promisify } from "node:util";
 import {
@@ -62,7 +61,6 @@ import {
   IMESSAGE_SERVICE_NAME,
   type IMessageChat,
   type IMessageChatType,
-  IMessageCliError,
   IMessageConfigurationError,
   IMessageEventTypes,
   type IMessageListMessagesOptions,
@@ -1236,21 +1234,20 @@ export class IMessageService extends Service implements IIMessageService {
       throw new IMessageConfigurationError("Settings not loaded");
     }
 
-    // Check if CLI tool exists (if specified and not default)
+    // Preserve the legacy setting as readable configuration so existing
+    // installs still boot, but never execute it. The canonical connector is
+    // deliberately self-contained: chat.db for inbound reads and Apple's
+    // bundled osascript/Messages.app surface for outbound delivery.
     if (this.settings.cliPath !== "imsg") {
-      if (!existsSync(this.settings.cliPath)) {
-        logger.warn(`iMessage CLI not found at ${this.settings.cliPath}, will use AppleScript`);
-      }
-    }
-
-    // Check if Messages app is accessible
-    try {
-      await this.runAppleScript('tell application "Messages" to return 1');
-    } catch (_error) {
-      throw new IMessageConfigurationError(
-        "Cannot access Messages app. Ensure Full Disk Access is granted."
+      logger.warn(
+        "[imessage] IMESSAGE_CLI_PATH is deprecated and ignored; using the native macOS Messages bridge"
       );
     }
+
+    // Do not probe Messages.app during service startup. Sending is gated by
+    // Apple Automation while chat.db reads are gated by Full Disk Access;
+    // coupling them prevented receive-only operation and could trigger an
+    // unrelated TCC prompt merely by enabling inbound messages.
   }
 
   private async sendSingleMessage(
@@ -1258,40 +1255,10 @@ export class IMessageService extends Service implements IIMessageService {
     text: string,
     options?: IMessageSendOptions
   ): Promise<IMessageSendResult> {
-    // Try CLI first if available
-    if (this.settings?.cliPath && this.settings.cliPath !== "imsg") {
-      try {
-        return await this.sendViaCli(to, text, options);
-      } catch (error) {
-        logger.debug(`CLI send failed, falling back to AppleScript: ${error}`);
-      }
-    }
-
-    // Fall back to AppleScript
+    // Outbound delivery stays on Apple's local Messages automation surface.
+    // No third-party CLI, daemon, network service, or fallback transport is
+    // invoked from the native connector.
     return await this.sendViaAppleScript(to, text, options);
-  }
-
-  private async sendViaCli(
-    to: string,
-    text: string,
-    options?: IMessageSendOptions
-  ): Promise<IMessageSendResult> {
-    if (!this.settings) {
-      return { success: false, error: "Service not initialized" };
-    }
-
-    const args = [to, text];
-    if (options?.mediaUrl) {
-      args.push("--attachment", options.mediaUrl);
-    }
-
-    try {
-      await execFileAsync(this.settings.cliPath, args);
-      return { success: true, messageId: Date.now().toString(), chatId: to };
-    } catch (error) {
-      const err = error as { code?: number; message?: string };
-      throw new IMessageCliError(err.message || "CLI command failed", err.code);
-    }
   }
 
   private async sendViaAppleScript(

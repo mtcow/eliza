@@ -36,7 +36,7 @@ export type IMessageChatType = "direct" | "group";
  * Configuration settings for the iMessage plugin
  */
 export interface IMessageSettings {
-  /** Path to iMessage CLI tool */
+  /** Deprecated compatibility setting; native delivery ignores it. */
   cliPath: string;
   /** Path to iMessage database */
   dbPath?: string;

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 interface PackageManifest {
   agentConfig?: {
+    pluginParameters?: Record<string, unknown>;
     configUiHints?: Record<string, { requiresAny?: string[] }>;
   };
 }
@@ -28,5 +29,10 @@ describe("iMessage package config hints", () => {
     ]) {
       expect(hints[key]?.requiresAny).toBeUndefined();
     }
+  });
+
+  it("does not advertise the deprecated auxiliary CLI transport", () => {
+    expect(manifest.agentConfig?.pluginParameters).not.toHaveProperty("IMESSAGE_CLI_PATH");
+    expect(manifest.agentConfig?.configUiHints).not.toHaveProperty("IMESSAGE_CLI_PATH");
   });
 });
