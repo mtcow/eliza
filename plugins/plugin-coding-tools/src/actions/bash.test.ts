@@ -3215,6 +3215,34 @@ describe("destructive-bulk confirm gate", () => {
     },
   );
 
+  it.each([
+    ["line feed", "\n"],
+    ["carriage return", "\r"],
+    ["background separator", " & "],
+  ])(
+    "blocks an unconfirmed recursive delete after an unquoted %s",
+    async (_name, separator) => {
+      const { command, target } = await createRecursiveDeleteCommand();
+      const { runtime } = await makeRuntime();
+      try {
+        const result = await shellAction.handler?.(
+          runtime,
+          makeMessage(undefined, "inspect, then clean up the old projects"),
+          undefined,
+          { command: `printf safe${separator}${command}` },
+        );
+        expect(result.success).toBe(false);
+        expect(result.text).toContain("needs_confirmation");
+        expect(result.data).toMatchObject({
+          destructive_reason: "recursive delete",
+        });
+        expect(await pathExists(target)).toBe(true);
+      } finally {
+        await fs.rm(target, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("runs the same command when confirm=true", async () => {
     const { command, target } = await createRecursiveDeleteCommand();
     const { runtime } = await makeRuntime();

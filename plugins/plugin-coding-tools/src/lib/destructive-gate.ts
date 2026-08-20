@@ -69,8 +69,8 @@ const DESTRUCTIVE_BINS = new Set(["mkfs", "shred", "wipefs"]);
 const DROP_SQL = /\bdrop\s+(database|table|schema)\s+(\S+)/i;
 
 function splitSegments(command: string): string[] {
-  // Chain + pipeline split; quotes are respected coarsely — a metacharacter
-  // inside quotes stays put because we only split on unquoted operators.
+  // Split shell list/pipeline operators while retaining quoted or backslash-
+  // escaped characters in their current segment.
   const segments: string[] = [];
   let current = "";
   let quote: string | null = null;
@@ -78,7 +78,18 @@ function splitSegments(command: string): string[] {
     const ch = command[i] as string;
     if (quote) {
       current += ch;
+      if (quote === '"' && ch === "\\" && i + 1 < command.length) {
+        current += command[i + 1] as string;
+        i += 1;
+        continue;
+      }
       if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < command.length) {
+      current += ch;
+      current += command[i + 1] as string;
+      i += 1;
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -86,10 +97,10 @@ function splitSegments(command: string): string[] {
       current += ch;
       continue;
     }
-    if (ch === "|" || ch === ";" || (ch === "&" && command[i + 1] === "&")) {
+    if (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r") {
       segments.push(current);
       current = "";
-      if (ch === "&") i += 1;
+      if (ch === "&" && command[i + 1] === "&") i += 1;
       continue;
     }
     current += ch;

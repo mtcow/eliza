@@ -74,6 +74,17 @@ describe("classifyDestructiveCommand — fires", () => {
     const v = classifyDestructiveCommand("ls && rm -rf ./data");
     expect(v.destructive).toBe(true);
   });
+  it.each([
+    ["line feed", "printf safe\nrm -rf ./data"],
+    ["carriage return", "printf safe\rrm -rf ./data"],
+    ["background separator", "printf safe & rm -rf ./data"],
+  ])("recursive rm hidden behind an unquoted %s", (_name, command) => {
+    expect(classifyDestructiveCommand(command)).toMatchObject({
+      destructive: true,
+      reason: "recursive delete",
+      targets: ["./data"],
+    });
+  });
   it("forced glob delete", () => {
     expect(
       classifyDestructiveCommand("rm -f /var/log/app/*.log").destructive,
@@ -129,5 +140,14 @@ describe("classifyDestructiveCommand — must NOT fire", () => {
     expect(
       classifyDestructiveCommand('echo "rm -rf would be bad"').destructive,
     ).toBe(false);
+  });
+  it.each([
+    ["line feed", "printf 'safe\nrm -rf ./data'"],
+    ["carriage return", "printf 'safe\rrm -rf ./data'"],
+    ["ampersand", "printf 'safe & rm -rf ./data'"],
+    ["escaped ampersand", "printf safe \\& rm -rf ./data"],
+    ["escaped line feed", "printf safe \\\nrm -rf ./data"],
+  ])("quoted %s content remains one benign segment", (_name, command) => {
+    expect(classifyDestructiveCommand(command).destructive).toBe(false);
   });
 });
