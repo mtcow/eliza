@@ -273,6 +273,57 @@ function groundingAuthorityMarker(selection: SelectedGrounding): ModelMessage {
   };
 }
 
+function groundingProjectionMessages(
+  message: SharedRuntimeHistoryMessageLike,
+  selection: SelectedGrounding,
+): ModelMessage[] {
+  if (selection.status !== "available") return [groundingAuthorityMarker(selection)];
+  if (selection.grounding.kind !== "web_search") return [];
+  const toolCallId = `persisted-web-${stringToUuid(`shared:${messageIdentity(message)}`)}`;
+  return [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId,
+          toolName: "WEB_SEARCH",
+          input: { query: selection.grounding.query },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: "WEB_SEARCH",
+          output: {
+            type: "text",
+            value: encodeSharedPublicWebGrounding(selection.grounding),
+          },
+        },
+      ],
+    },
+  ];
+}
+
+/**
+ * Projects only canonical grounding authority derived from typed assistant
+ * grounding. Persisted system and transcript strings never enter this result.
+ */
+export function sharedRuntimeGroundingProjectionMessages(
+  history: SharedRuntimeHistoryMessageLike[],
+  queryText: string,
+  now = Date.now(),
+): ModelMessage[] {
+  const selected = selectedGrounding(history, queryText, now);
+  if (!selected) return [];
+  const message = history[selected.index];
+  return message ? groundingProjectionMessages(message, selected) : [];
+}
+
 /** Projects selected evidence as native tool results while keeping assistant prose separate. */
 export function sharedRuntimeModelHistoryMessages(
   history: SharedRuntimeHistoryMessageLike[],
@@ -282,38 +333,12 @@ export function sharedRuntimeModelHistoryMessages(
   const selected = selectedGrounding(history, queryText, now);
   const messages: ModelMessage[] = [];
   for (const [index, message] of history.entries()) {
-    const grounding =
-      selected?.index === index && selected.status === "available"
-        ? parseSharedPublicWebGrounding(message.grounding)
-        : undefined;
-    if (grounding?.kind === "web_search") {
-      const toolCallId = `persisted-web-${stringToUuid(`shared:${messageIdentity(message)}`)}`;
-      messages.push({
-        role: "assistant",
-        content: [
-          {
-            type: "tool-call",
-            toolCallId,
-            toolName: "WEB_SEARCH",
-            input: { query: grounding.query },
-          },
-        ],
-      });
-      messages.push({
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId,
-            toolName: "WEB_SEARCH",
-            output: { type: "text", value: encodeSharedPublicWebGrounding(grounding) },
-          },
-        ],
-      });
+    if (selected?.index === index && selected.status === "available") {
+      messages.push(...groundingProjectionMessages(message, selected));
     }
     messages.push({ role: message.role, content: sharedRuntimeModelHistoryContent(message) });
     if (selected?.index === index && selected.status !== "available") {
-      messages.push(groundingAuthorityMarker(selected));
+      messages.push(...groundingProjectionMessages(message, selected));
     }
   }
   return messages;
