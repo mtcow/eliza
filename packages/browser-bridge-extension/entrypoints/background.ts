@@ -1,0 +1,1140 @@
+/**
+ * Extension service worker — the always-on coordinator. Runs the periodic sync
+ * loop, auto-pairs with the local agent, pulls agent-directed browser sessions
+ * and executes them via the content script, and enforces the website blocklist
+ * through declarativeNetRequest. Bridges popup requests and content-script
+ * responses to the BrowserBridgeRelayClient.
+ *
+ * Under MV3 the worker can be evicted between events, so durable state lives in
+ * chrome.storage.local via src/storage.ts rather than in module scope.
+ */
+import { browserActionAuthorizationError } from "../src/action-authorization";
+import { BrowserBridgeRelayClient, RelayApiError } from "../src/api-client";
+import type {
+  BrowserBridgeAction,
+  BrowserBridgeSettings,
+  LifeOpsBrowserSession,
+} from "../src/browser-bridge-contracts";
+import { sendWithContentScriptRecovery } from "../src/content-script-messaging";
+import type {
+  BackgroundState,
+  CompanionAutoPairRequest,
+  CompanionAutoPairResponse,
+  CompanionConfig,
+  CompanionPreflightRequest,
+  CompanionSession,
+  CompanionSyncRequest,
+  ContentScriptResponse,
+  DomActionRequest,
+  PopupRequest,
+  PopupResponse,
+} from "../src/protocol";
+import {
+  clearCompanionConfig,
+  discoverReachableAgentApiBaseUrls,
+  getOrCreateExtensionProfileId,
+  isLoopbackApiBaseUrl,
+  isValidApiBaseUrl,
+  loadBackgroundState,
+  loadCompanionConfig,
+  normalizeAutoPairCompanionConfig,
+  normalizeCompanionConfig,
+  saveBackgroundState,
+  saveCompanionConfig,
+} from "../src/storage";
+import {
+  findFocusedTab,
+  type RememberedTab,
+  selectTabsForSync,
+} from "../src/tab-cache";
+import {
+  addAlarmListener,
+  addInstalledListener,
+  addRuntimeMessageListener,
+  addStartupListener,
+  addTabsActivatedListener,
+  addTabsRemovedListener,
+  addTabsUpdatedListener,
+  addWindowFocusListener,
+  createAlarm,
+  createTab,
+  executeContentScriptFiles,
+  focusWindow,
+  getAllWindows,
+  getDynamicRules,
+  getExtensionUrl,
+  getGrantedOrigins,
+  getManifestVersion,
+  hasAllUrlHostPermission,
+  hasManifestPermission,
+  isIncognitoAccessAllowed,
+  queryTabs,
+  reloadTab,
+  sendTabMessage,
+  updateDynamicRules,
+  updateTab,
+} from "../src/webextension";
+
+declare const __BROWSER_BRIDGE_KIND__: "chrome" | "firefox" | "safari";
+
+const SYNC_ALARM = "browser-bridge-sync";
+const SYNC_INTERVAL_MINUTES = 0.5;
+const SYNC_DEBOUNCE_MS = 750;
+const MAX_REMEMBERED_TABS = 10;
+const AUTO_PAIR_COOLDOWN_MS = 30_000;
+const AUTO_PAIR_ROUTE = "/api/browser-bridge/companions/auto-pair";
+
+let backgroundState: BackgroundState = {
+  config: null,
+  settings: null,
+  syncing: false,
+  lastSyncAt: null,
+  lastError: null,
+  lastSessionStatus: null,
+  activeSessionId: null,
+  rememberedTabCount: 0,
+  settingsSummary: null,
+};
+let rememberedTabs: RememberedTab[] = [];
+let syncScheduled = false;
+let syncInFlight = false;
+let activeSessionId: string | null = null;
+let autoPairInFlight = false;
+let lastAutoPairAttemptAt = 0;
+
+function canSyncUrl(url: string | undefined): url is string {
+  return typeof url === "string" && /^https?:\/\//i.test(url);
+}
+
+function readAutoPairError(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  if (typeof record.error === "string" && record.error.trim()) {
+    return record.error.trim();
+  }
+  if (typeof record.message === "string" && record.message.trim()) {
+    return record.message.trim();
+  }
+  return null;
+}
+
+function parseNumericId(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function buildAutoPairRequest(
+  config: CompanionConfig | null,
+): Promise<CompanionAutoPairRequest> {
+  const profileId =
+    config?.profileId ?? (await getOrCreateExtensionProfileId());
+  return {
+    browser: __BROWSER_BRIDGE_KIND__,
+    profileId,
+    profileLabel: config?.profileLabel ?? "Default",
+    label: config?.label ?? "",
+    extensionVersion: getManifestVersion(),
+  };
+}
+
+function autoPairErrorMessage(
+  apiBaseUrl: string,
+  status: number | null,
+  error: string,
+): string {
+  if (status === 401 || status === 403) {
+    return `Open ${apiBaseUrl} while logged in, then reopen the Agent Browser Bridge popup to auto-pair.`;
+  }
+  if (status === 404) {
+    return `${apiBaseUrl} does not expose browser-bridge auto-pair yet.`;
+  }
+  return error;
+}
+
+function isCompanionAuthError(error: unknown): error is RelayApiError {
+  if (!(error instanceof RelayApiError) || error.status !== 401) {
+    return false;
+  }
+  return (
+    error.code === null ||
+    error.code === "browser_bridge_companion_pairing_invalid" ||
+    error.code === "browser_bridge_companion_token_expired" ||
+    error.code === "browser_bridge_companion_token_revoked"
+  );
+}
+
+function companionAuthErrorMessage(error: RelayApiError): string {
+  if (error.code === "browser_bridge_companion_token_revoked") {
+    return "Pairing was revoked. Agent Browser Bridge will try to auto-pair again.";
+  }
+  if (error.code === "browser_bridge_companion_token_expired") {
+    return "Pairing expired. Agent Browser Bridge will try to auto-pair again.";
+  }
+  return "Pairing is no longer valid. Agent Browser Bridge will try to auto-pair again.";
+}
+
+function readAutoPairResponsePayload(
+  payload: unknown,
+  expectedApiBaseUrl: string,
+): CompanionAutoPairResponse | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const record = payload as {
+    companion?: unknown;
+    config?: Partial<CompanionConfig>;
+  };
+  if (!record.companion || typeof record.companion !== "object") {
+    return null;
+  }
+  const companion = record.companion as Record<string, unknown>;
+  const companionId =
+    typeof companion.id === "string" ? companion.id.trim() : "";
+  if (companion.browser !== __BROWSER_BRIDGE_KIND__ || !companionId) {
+    return null;
+  }
+  const config = normalizeAutoPairCompanionConfig(record.config, {
+    apiBaseUrl: expectedApiBaseUrl,
+    browser: __BROWSER_BRIDGE_KIND__,
+    companionId,
+  });
+  if (!config) {
+    return null;
+  }
+  return {
+    companion: record.companion as CompanionAutoPairResponse["companion"],
+    config,
+  };
+}
+
+async function requestAutoPairFromBackground(
+  apiBaseUrl: string,
+  request: CompanionAutoPairRequest,
+): Promise<
+  | { ok: true; data: CompanionAutoPairResponse }
+  | { ok: false; status: number | null; error: string }
+> {
+  try {
+    const response = await fetch(`${apiBaseUrl}${AUTO_PAIR_ROUTE}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify(request),
+    });
+    let payload:
+      | CompanionAutoPairResponse
+      | { error?: string; message?: string }
+      | null;
+    try {
+      payload = (await response.json()) as
+        | CompanionAutoPairResponse
+        | { error?: string; message?: string };
+    } catch {
+      // error-policy:J3 Malformed auto-pair JSON becomes an invalid response,
+      // never a partially trusted companion config.
+      payload = null;
+    }
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error:
+          readAutoPairError(payload) ||
+          `${response.status} ${response.statusText}`,
+      };
+    }
+    const data = readAutoPairResponsePayload(payload, apiBaseUrl);
+    if (!data) {
+      return {
+        ok: false,
+        status: response.status,
+        error: "Auto-pair returned an invalid companion config.",
+      };
+    }
+    return { ok: true, data };
+  } catch (error) {
+    // error-policy:J4 Auto-pair transport failures remain explicit popup state.
+    return {
+      ok: false,
+      status: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function attemptAutoPair(
+  reason: string,
+): Promise<CompanionConfig | null> {
+  if (autoPairInFlight) {
+    return null;
+  }
+  const now = Date.now();
+  if (now - lastAutoPairAttemptAt < AUTO_PAIR_COOLDOWN_MS) {
+    return null;
+  }
+  lastAutoPairAttemptAt = now;
+  autoPairInFlight = true;
+
+  try {
+    const existingConfig = await loadCompanionConfig();
+    const request = await buildAutoPairRequest(existingConfig);
+    // Every candidate has already passed the background-owned /api/status
+    // probe. Page tabs never execute pairing fetches in the page's MAIN world.
+    const candidateApiBaseUrls = await discoverReachableAgentApiBaseUrls();
+    let lastErrorMessage =
+      "Open Eliza in this browser, then reopen the popup to auto-pair.";
+
+    for (const apiBaseUrl of candidateApiBaseUrls) {
+      // Auto-pair is a local-machine trust path. Remote/manual relay configs
+      // remain supported, but remote pages cannot mint pairing credentials.
+      if (isLoopbackApiBaseUrl(apiBaseUrl)) {
+        const response = await requestAutoPairFromBackground(
+          apiBaseUrl,
+          request,
+        );
+        if (response.ok) {
+          const config = await saveCompanionConfig(response.data.config);
+          if (config) {
+            createAlarm(SYNC_ALARM, SYNC_INTERVAL_MINUTES);
+            await setState({
+              config,
+              lastError: null,
+              lastSessionStatus: `Auto-paired with ${apiBaseUrl}`,
+            });
+            return config;
+          }
+        }
+        if ("error" in response) {
+          lastErrorMessage = autoPairErrorMessage(
+            apiBaseUrl,
+            response.status,
+            response.error,
+          );
+        }
+      }
+    }
+
+    await setState({
+      lastError:
+        reason === "popup"
+          ? lastErrorMessage
+          : (backgroundState.lastError ?? lastErrorMessage),
+    });
+    return null;
+  } finally {
+    autoPairInFlight = false;
+  }
+}
+
+async function saveState(): Promise<void> {
+  backgroundState = {
+    ...backgroundState,
+    rememberedTabCount: rememberedTabs.length,
+    activeSessionId,
+  };
+  await saveBackgroundState(backgroundState);
+}
+
+async function setState(next: Partial<BackgroundState>): Promise<void> {
+  backgroundState = {
+    ...backgroundState,
+    ...next,
+  };
+  await saveState();
+}
+
+async function readConfig(): Promise<CompanionConfig | null> {
+  const config = await loadCompanionConfig();
+  backgroundState.config = config;
+  return config;
+}
+
+async function describePermissionState(): Promise<{
+  tabs: boolean;
+  scripting: boolean;
+  activeTab: boolean;
+  allOrigins: boolean;
+  grantedOrigins: string[];
+  incognitoEnabled: boolean;
+}> {
+  return {
+    tabs: true,
+    scripting: true,
+    activeTab: hasManifestPermission("activeTab"),
+    allOrigins: await hasAllUrlHostPermission(),
+    grantedOrigins: await getGrantedOrigins(),
+    incognitoEnabled: await isIncognitoAccessAllowed(),
+  };
+}
+
+async function collectSnapshotTabs(
+  config: CompanionConfig,
+  settings: BrowserBridgeSettings | null,
+): Promise<RememberedTab[]> {
+  const windows = await getAllWindows();
+  const snapshot: RememberedTab[] = [];
+  const nowIso = new Date().toISOString();
+  for (const windowInfo of windows) {
+    for (const tab of windowInfo.tabs ?? []) {
+      if (!canSyncUrl(tab.url)) {
+        continue;
+      }
+      if (typeof tab.id !== "number" || typeof tab.windowId !== "number") {
+        continue;
+      }
+      snapshot.push({
+        browser: config.browser,
+        profileId: config.profileId,
+        windowId: String(tab.windowId),
+        tabId: String(tab.id),
+        url: tab.url,
+        title: tab.title?.trim() || tab.url,
+        activeInWindow: tab.active === true,
+        focusedWindow: windowInfo.focused === true,
+        focusedActive: tab.active === true && windowInfo.focused === true,
+        incognito: tab.incognito === true,
+        faviconUrl: tab.favIconUrl ?? null,
+        lastSeenAt: nowIso,
+        lastFocusedAt: tab.active === true ? nowIso : null,
+        metadata: {},
+      });
+    }
+  }
+  rememberedTabs = selectTabsForSync({
+    previous: rememberedTabs,
+    snapshot,
+    settings,
+    grantedOrigins: await getGrantedOrigins(),
+    fallbackMaxRememberedTabs: MAX_REMEMBERED_TABS,
+  });
+  await saveState();
+  return rememberedTabs;
+}
+
+async function captureFocusedPageContext(
+  tabs: readonly RememberedTab[],
+): Promise<CompanionSyncRequest["pageContexts"]> {
+  const focused = findFocusedTab(tabs);
+  if (!focused) {
+    return [];
+  }
+  const tabId = parseNumericId(focused.tabId);
+  if (tabId === null) {
+    return [];
+  }
+  try {
+    const response = await sendContentScriptMessage(tabId, {
+      type: "browser-bridge:capture-page",
+      expectedUrl: focused.url,
+    });
+    if (!response.ok || !response.page) {
+      return [];
+    }
+    return [
+      {
+        browser: focused.browser,
+        profileId: focused.profileId,
+        windowId: focused.windowId,
+        tabId: focused.tabId,
+        url: response.page.url,
+        title: response.page.title,
+        selectionText: response.page.selectionText,
+        mainText: response.page.mainText,
+        headings: response.page.headings,
+        links: response.page.links,
+        forms: response.page.forms,
+        capturedAt: response.page.capturedAt,
+      },
+    ];
+  } catch {
+    // error-policy:J4 Page capture failure omits that tab's optional context;
+    // the tab remains visible and no synthetic page contents are emitted.
+    return [];
+  }
+}
+
+async function sendContentScriptMessage(
+  tabId: number,
+  message: unknown,
+): Promise<ContentScriptResponse> {
+  return await sendWithContentScriptRecovery({
+    send: () => sendTabMessage<ContentScriptResponse>(tabId, message),
+    inject: () => executeContentScriptFiles(tabId, ["content.js"]),
+  });
+}
+
+async function buildSyncRequest(
+  config: CompanionConfig,
+  settings: BrowserBridgeSettings,
+  settingsVersion: string,
+): Promise<CompanionSyncRequest> {
+  const tabs = await collectSnapshotTabs(config, settings);
+  return {
+    settingsVersion,
+    companion: {
+      browser: config.browser,
+      profileId: config.profileId,
+      profileLabel: config.profileLabel,
+      label: config.label,
+      extensionVersion: getManifestVersion(),
+      connectionState: "connected",
+      permissions: await describePermissionState(),
+      lastSeenAt: new Date().toISOString(),
+    },
+    tabs,
+    pageContexts: await captureFocusedPageContext(tabs),
+  };
+}
+
+async function buildPreflightRequest(
+  config: CompanionConfig,
+): Promise<CompanionPreflightRequest> {
+  return {
+    companion: {
+      browser: config.browser,
+      profileId: config.profileId,
+      profileLabel: config.profileLabel,
+      label: config.label,
+      extensionVersion: getManifestVersion(),
+      connectionState: "connected",
+      permissions: await describePermissionState(),
+      lastSeenAt: new Date().toISOString(),
+    },
+  };
+}
+
+async function preflightAndSync(
+  client: BrowserBridgeRelayClient,
+  config: CompanionConfig,
+) {
+  const preflight = await client.preflight(await buildPreflightRequest(config));
+  backgroundState.settings = preflight.settings;
+  return await client.sync(
+    await buildSyncRequest(
+      config,
+      preflight.settings,
+      preflight.settingsVersion,
+    ),
+  );
+}
+
+async function resolveTargetTab(
+  action: BrowserBridgeAction,
+  session: CompanionSession,
+  currentTabId: number | null,
+): Promise<number | null> {
+  const explicitTabId =
+    parseNumericId(action.tabId) ??
+    parseNumericId(session.tabId) ??
+    currentTabId;
+  if (explicitTabId !== null) {
+    return explicitTabId;
+  }
+  const activeTabs = await queryTabs({ active: true, currentWindow: true });
+  return typeof activeTabs[0]?.id === "number" ? activeTabs[0].id : null;
+}
+
+async function runContentAction(
+  tabId: number,
+  expectedUrl: string,
+  action: DomActionRequest,
+): Promise<Record<string, unknown>> {
+  const response = await sendContentScriptMessage(tabId, {
+    type: "browser-bridge:execute-dom-action",
+    expectedUrl,
+    action,
+  });
+  if (response.ok === false) {
+    throw new Error(response.error);
+  }
+  return response.actionResult ?? {};
+}
+
+async function executeAction(
+  client: BrowserBridgeRelayClient,
+  config: CompanionConfig,
+  session: CompanionSession,
+  action: BrowserBridgeAction,
+  currentTabId: number | null,
+): Promise<{ currentTabId: number | null; result: Record<string, unknown> }> {
+  const freshSync = await preflightAndSync(client, config);
+  backgroundState.settings = freshSync.settings;
+  const resolvedTabId = await resolveTargetTab(action, session, currentTabId);
+  const openTabs = await queryTabs({});
+  const focusedTab =
+    (await queryTabs({ active: true, lastFocusedWindow: true }))[0] ?? null;
+  const existingTarget =
+    resolvedTabId === null
+      ? null
+      : (openTabs.find((tab) => tab.id === resolvedTabId) ?? null);
+  const targetUrl =
+    action.kind === "open" || action.kind === "navigate"
+      ? action.url
+      : existingTarget?.url;
+  if (!targetUrl) {
+    throw new Error(`${action.kind} requires an authorized target URL`);
+  }
+  const authorizationError = browserActionAuthorizationError({
+    settings: freshSync.settings,
+    target: {
+      url: targetUrl,
+      incognito: existingTarget?.incognito === true,
+      focusedActive:
+        existingTarget !== null &&
+        existingTarget.id === focusedTab?.id &&
+        existingTarget.active === true,
+    },
+    grantedOrigins: await getGrantedOrigins(),
+    currentFocusedUrl: focusedTab?.url ?? null,
+  });
+  if (authorizationError) {
+    throw new Error(authorizationError);
+  }
+  if (freshSync.session?.id !== session.id) {
+    throw new Error(
+      "The browser session is no longer the active session for this companion.",
+    );
+  }
+
+  switch (action.kind) {
+    case "open": {
+      if (!action.url) {
+        throw new Error("open requires url");
+      }
+      const tab = await createTab({ url: action.url, active: true });
+      return {
+        currentTabId: typeof tab.id === "number" ? tab.id : null,
+        result: {
+          openedUrl: action.url,
+          tabId: tab.id ?? null,
+          windowId: tab.windowId ?? null,
+        },
+      };
+    }
+    case "navigate": {
+      if (!action.url) {
+        throw new Error("navigate requires url");
+      }
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        const tab = await createTab({ url: action.url, active: true });
+        return {
+          currentTabId: typeof tab.id === "number" ? tab.id : null,
+          result: {
+            navigatedUrl: action.url,
+            tabId: tab.id ?? null,
+            createdTab: true,
+          },
+        };
+      }
+      const tab = await updateTab(tabId, { url: action.url, active: true });
+      if (typeof tab.windowId === "number") {
+        await focusWindow(tab.windowId);
+      }
+      return {
+        currentTabId: tabId,
+        result: {
+          navigatedUrl: action.url,
+          tabId,
+        },
+      };
+    }
+    case "focus_tab": {
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        throw new Error("focus_tab requires a target tab");
+      }
+      const tab = await updateTab(tabId, { active: true });
+      if (typeof tab.windowId === "number") {
+        await focusWindow(tab.windowId);
+      }
+      return {
+        currentTabId: tabId,
+        result: {
+          focusedTabId: tabId,
+        },
+      };
+    }
+    case "reload": {
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        throw new Error("reload requires a target tab");
+      }
+      await reloadTab(tabId);
+      return {
+        currentTabId: tabId,
+        result: {
+          reloadedTabId: tabId,
+        },
+      };
+    }
+    case "back": {
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        throw new Error("back requires a target tab");
+      }
+      return {
+        currentTabId: tabId,
+        result: await runContentAction(tabId, targetUrl, {
+          kind: "history_back",
+        }),
+      };
+    }
+    case "forward": {
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        throw new Error("forward requires a target tab");
+      }
+      return {
+        currentTabId: tabId,
+        result: await runContentAction(tabId, targetUrl, {
+          kind: "history_forward",
+        }),
+      };
+    }
+    case "click":
+    case "type":
+    case "submit": {
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        throw new Error(`${action.kind} requires a target tab`);
+      }
+      return {
+        currentTabId: tabId,
+        result: await runContentAction(tabId, targetUrl, {
+          kind: action.kind,
+          selector: action.selector ?? null,
+          text: action.text ?? null,
+        }),
+      };
+    }
+    case "read_page":
+    case "extract_links":
+    case "extract_forms": {
+      const tabId = resolvedTabId;
+      if (tabId === null) {
+        throw new Error(`${action.kind} requires a target tab`);
+      }
+      const response = await sendContentScriptMessage(tabId, {
+        type: "browser-bridge:capture-page",
+        expectedUrl: targetUrl,
+      });
+      if (response.ok === false || !response.page) {
+        throw new Error(
+          "error" in response ? response.error : "page capture failed",
+        );
+      }
+      const result =
+        action.kind === "read_page"
+          ? {
+              title: response.page.title,
+              url: response.page.url,
+              selectionText: response.page.selectionText,
+              mainText: response.page.mainText,
+            }
+          : action.kind === "extract_links"
+            ? { links: response.page.links }
+            : { forms: response.page.forms };
+      return {
+        currentTabId: tabId,
+        result,
+      };
+    }
+    default:
+      throw new Error(`Unsupported action kind ${action.kind}`);
+  }
+}
+
+async function executeSession(
+  client: BrowserBridgeRelayClient,
+  session: LifeOpsBrowserSession,
+): Promise<void> {
+  if (activeSessionId === session.id) {
+    return;
+  }
+  activeSessionId = session.id;
+  await setState({
+    activeSessionId,
+    lastSessionStatus: `running ${session.title}`,
+    lastError: null,
+  });
+
+  const actionResults: Record<string, unknown> = {};
+  let currentTabId = parseNumericId(session.tabId);
+
+  try {
+    for (
+      let index = session.currentActionIndex;
+      index < session.actions.length;
+      index += 1
+    ) {
+      const action = session.actions[index];
+      const config = await readConfig();
+      if (!config) {
+        throw new Error("Browser companion configuration is unavailable.");
+      }
+      const outcome = await executeAction(
+        client,
+        config,
+        session,
+        action,
+        currentTabId,
+      );
+      currentTabId = outcome.currentTabId;
+      actionResults[action.id] = outcome.result;
+      await client.updateSessionProgress(session.id, {
+        completedActionId: action.id,
+        currentActionIndex: index + 1,
+        result: {
+          [action.id]: outcome.result,
+        },
+        metadata: {
+          lastActionId: action.id,
+          lastActionKind: action.kind,
+        },
+      });
+    }
+    await client.completeSession(session.id, {
+      status: "done",
+      result: {
+        actionResults,
+      },
+    });
+    await setState({
+      lastSessionStatus: `completed ${session.title}`,
+    });
+  } catch (error) {
+    // error-policy:J1 Session execution owns the terminal failure transition.
+    await client.completeSession(session.id, {
+      status: "failed",
+      result: {
+        actionResults,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    await setState({
+      lastError: error instanceof Error ? error.message : String(error),
+      lastSessionStatus: `failed ${session.title}`,
+    });
+  } finally {
+    activeSessionId = null;
+    await saveState();
+  }
+}
+
+const BLOCKING_RULE_ID_OFFSET = 10_001;
+const ALLOWLIST_RULE_ID_OFFSET = 20_001;
+
+async function syncBlockingRules(apiBase: string): Promise<void> {
+  const resp = await fetch(`${apiBase}/api/website-blocker`);
+  if (!resp.ok) {
+    throw new Error(
+      `website blocker sync failed: ${resp.status} ${resp.statusText}`,
+    );
+  }
+  const data = (await resp.json()) as {
+    active?: boolean;
+    blockedWebsites?: string[];
+    allowedWebsites?: string[];
+    websites?: string[];
+  };
+
+  const existingRules = await getDynamicRules();
+  const blockingRuleIds = existingRules
+    .filter(
+      (rule) =>
+        rule.id >= BLOCKING_RULE_ID_OFFSET &&
+        rule.id < BLOCKING_RULE_ID_OFFSET + 5_000,
+    )
+    .map((rule) => rule.id);
+  const allowRuleIds = existingRules
+    .filter(
+      (rule) =>
+        rule.id >= ALLOWLIST_RULE_ID_OFFSET &&
+        rule.id < ALLOWLIST_RULE_ID_OFFSET + 5_000,
+    )
+    .map((rule) => rule.id);
+
+  if (
+    !data.active ||
+    !Array.isArray(data.blockedWebsites ?? data.websites) ||
+    (data.blockedWebsites ?? data.websites)?.length === 0
+  ) {
+    const ruleIdsToRemove = [...blockingRuleIds, ...allowRuleIds];
+    if (ruleIdsToRemove.length > 0) {
+      await updateDynamicRules({ removeRuleIds: ruleIdsToRemove });
+    }
+    return;
+  }
+
+  const extensionBlockedPage = getExtensionUrl("blocked.html");
+  const blockedWebsites = (data.blockedWebsites ?? data.websites ?? []).filter(
+    (website): website is string => typeof website === "string",
+  );
+  if (!(await hasAllUrlHostPermission())) {
+    throw new Error(
+      "Grant Website Access in the extension popup before enabling LifeOps website blocking.",
+    );
+  }
+  const allowedWebsites = (data.allowedWebsites ?? []).filter(
+    (website): website is string => typeof website === "string",
+  );
+  const blockedRules = blockedWebsites.map((host, index) => ({
+    id: BLOCKING_RULE_ID_OFFSET + index,
+    priority: 1,
+    action: {
+      type: "redirect" as const,
+      redirect: {
+        url: `${extensionBlockedPage}?host=${encodeURIComponent(host)}&url=${encodeURIComponent(`https://${host}`)}&api=${encodeURIComponent(apiBase)}`,
+      },
+    },
+    condition: {
+      urlFilter: `||${host}^`,
+      resourceTypes: ["main_frame" as const],
+    },
+  }));
+  const allowRules = allowedWebsites.map((host, index) => ({
+    id: ALLOWLIST_RULE_ID_OFFSET + index,
+    priority: 2,
+    action: {
+      type: "allow" as const,
+    },
+    condition: {
+      urlFilter: `||${host}^`,
+      resourceTypes: ["main_frame" as const],
+    },
+  }));
+
+  await updateDynamicRules({
+    removeRuleIds: [...blockingRuleIds, ...allowRuleIds],
+    addRules: [...allowRules, ...blockedRules],
+  });
+}
+
+async function syncNow(reason: string): Promise<BackgroundState> {
+  let config = await readConfig();
+  if (!config) {
+    config = await attemptAutoPair(reason);
+  }
+  if (!config) {
+    await setState({
+      syncing: false,
+      lastError:
+        backgroundState.lastError ??
+        "Agent Browser Bridge companion is not paired.",
+      settingsSummary: null,
+      lastSessionStatus: null,
+    });
+    return backgroundState;
+  }
+  if (syncInFlight) {
+    syncScheduled = true;
+    return backgroundState;
+  }
+  syncInFlight = true;
+  await setState({
+    syncing: true,
+    config,
+    lastError: null,
+  });
+
+  try {
+    const client = new BrowserBridgeRelayClient(config);
+    const response = await preflightAndSync(client, config);
+    await setState({
+      syncing: false,
+      lastSyncAt: new Date().toISOString(),
+      settings: response.settings,
+      settingsSummary: `${response.settings.enabled ? response.settings.trackingMode : "off"} / control ${response.settings.allowBrowserControl ? "on" : "off"}`,
+      lastError: null,
+      rememberedTabCount: response.tabs.length,
+    });
+    if (response.session) {
+      await executeSession(client, response.session);
+    }
+    try {
+      await syncBlockingRules(config.apiBaseUrl);
+    } catch (error) {
+      // error-policy:J4 Blocking-policy failure is shown in extension state
+      // without fabricating successful rule synchronization.
+      await setState({
+        lastError: `website blocker sync failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  } catch (error) {
+    // error-policy:J1 The sync-loop boundary translates failures into durable
+    // extension state and revokes invalid local pairing state.
+    const isPairingInvalid = isCompanionAuthError(error);
+    if (isPairingInvalid) {
+      syncScheduled = false;
+      await clearCompanionConfig();
+    }
+    await setState({
+      syncing: false,
+      ...(isPairingInvalid && { config: null, settingsSummary: null }),
+      lastError: isPairingInvalid
+        ? companionAuthErrorMessage(error)
+        : `${reason}: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  } finally {
+    syncInFlight = false;
+    if (syncScheduled) {
+      syncScheduled = false;
+      setTimeout(() => {
+        void syncNow("queued");
+      }, SYNC_DEBOUNCE_MS);
+    }
+  }
+  return backgroundState;
+}
+
+function scheduleSync(reason: string): void {
+  if (syncScheduled) {
+    return;
+  }
+  syncScheduled = true;
+  setTimeout(() => {
+    syncScheduled = false;
+    void syncNow(reason);
+  }, SYNC_DEBOUNCE_MS);
+}
+
+async function handlePopupMessage(
+  message: PopupRequest,
+): Promise<PopupResponse> {
+  try {
+    switch (message.type) {
+      case "browser-bridge:get-state": {
+        const config = await readConfig();
+        const persistedState = await loadBackgroundState();
+        backgroundState = persistedState ?? backgroundState;
+        backgroundState.config = config;
+        return { ok: true, state: backgroundState };
+      }
+      case "browser-bridge:auto-pair": {
+        await attemptAutoPair("popup");
+        return { ok: true, state: backgroundState };
+      }
+      case "browser-bridge:save-config": {
+        if (
+          typeof message.config?.apiBaseUrl === "string" &&
+          message.config.apiBaseUrl.trim().length > 0 &&
+          !isValidApiBaseUrl(message.config.apiBaseUrl)
+        ) {
+          throw new Error("apiBaseUrl must be an http:// or https:// URL");
+        }
+        const nextConfig = normalizeCompanionConfig({
+          ...(await readConfig()),
+          ...(message.config ?? {}),
+          browser: __BROWSER_BRIDGE_KIND__,
+        });
+        if (!nextConfig) {
+          throw new Error("companionId and pairingToken are required");
+        }
+        await saveCompanionConfig(nextConfig);
+        await setState({
+          config: nextConfig,
+          settings: backgroundState.settings,
+          lastError: null,
+        });
+        createAlarm(SYNC_ALARM, SYNC_INTERVAL_MINUTES);
+        scheduleSync("config");
+        return { ok: true, state: backgroundState };
+      }
+      case "browser-bridge:clear-config": {
+        await clearCompanionConfig();
+        rememberedTabs = [];
+        activeSessionId = null;
+        await setState({
+          config: null,
+          settings: null,
+          lastError: "Agent Browser Bridge companion pairing cleared.",
+          lastSessionStatus: null,
+          lastSyncAt: null,
+          rememberedTabCount: 0,
+          settingsSummary: null,
+        });
+        return { ok: true, state: backgroundState };
+      }
+      case "browser-bridge:sync-now": {
+        return { ok: true, state: await syncNow("popup") };
+      }
+      default:
+        throw new Error("Unsupported popup request");
+    }
+  } catch (error) {
+    // error-policy:J1 Popup requests return a structured failure response.
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      state: backgroundState,
+    };
+  }
+}
+
+addRuntimeMessageListener((message, _sender, sendResponse) => {
+  const request = message as PopupRequest | undefined;
+  if (!request || typeof request !== "object" || !("type" in request)) {
+    return false;
+  }
+  void handlePopupMessage(request).then((response) => {
+    sendResponse(response);
+  });
+  return true;
+});
+
+addInstalledListener(() => {
+  createAlarm(SYNC_ALARM, SYNC_INTERVAL_MINUTES);
+  scheduleSync("install");
+});
+
+addStartupListener(() => {
+  createAlarm(SYNC_ALARM, SYNC_INTERVAL_MINUTES);
+  scheduleSync("startup");
+});
+
+addAlarmListener((alarm) => {
+  if (alarm.name === SYNC_ALARM) {
+    void syncNow("alarm");
+  }
+});
+
+addTabsActivatedListener(() => {
+  scheduleSync("tab-activated");
+});
+
+addTabsUpdatedListener((_tabId, changeInfo) => {
+  const record = changeInfo as {
+    status?: string;
+    url?: string;
+    title?: string;
+  };
+  if (record.status === "complete" || record.url || record.title) {
+    scheduleSync("tab-updated");
+  }
+});
+
+addTabsRemovedListener(() => {
+  scheduleSync("tab-removed");
+});
+
+addWindowFocusListener(() => {
+  scheduleSync("window-focus");
+});
+
+void (async () => {
+  const persistedState = await loadBackgroundState();
+  if (persistedState) {
+    backgroundState = persistedState;
+  }
+  await readConfig();
+  createAlarm(SYNC_ALARM, SYNC_INTERVAL_MINUTES);
+  scheduleSync("startup-bootstrap");
+})();

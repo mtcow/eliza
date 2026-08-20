@@ -6,8 +6,12 @@ import type { Service, UUID } from "@elizaos/core";
 import type {
   BrowserBridgeCompanionAutoPairResponse,
   BrowserBridgeCompanionPairingResponse,
+  BrowserBridgeCompanionPreflightRequest,
+  BrowserBridgeCompanionPreflightResponse,
   BrowserBridgeCompanionRevokeResponse,
+  BrowserBridgeCompanionSessionProgressRequest,
   BrowserBridgeCompanionStatus,
+  BrowserBridgeCompanionSyncRequest,
   BrowserBridgeCompanionSyncResponse,
   BrowserBridgePageContext,
   BrowserBridgeSettings,
@@ -73,9 +77,15 @@ export interface BrowserBridgeRouteService extends Service {
   syncBrowserCompanion(
     companionId: string,
     pairingToken: string,
-    request: SyncBrowserBridgeStateRequest,
+    request: BrowserBridgeCompanionSyncRequest,
     ownerEntityId?: UUID | null,
   ): Promise<BrowserBridgeCompanionSyncResponse>;
+  preflightBrowserCompanion(
+    companionId: string,
+    pairingToken: string,
+    request: BrowserBridgeCompanionPreflightRequest,
+    ownerEntityId?: UUID | null,
+  ): Promise<BrowserBridgeCompanionPreflightResponse>;
   listBrowserSessions(
     ownerEntityId?: UUID | null,
   ): Promise<LifeOpsBrowserSession[]>;
@@ -106,7 +116,7 @@ export interface BrowserBridgeRouteService extends Service {
     companionId: string,
     pairingToken: string,
     sessionId: string,
-    request: UpdateBrowserBridgeSessionProgressRequest,
+    request: BrowserBridgeCompanionSessionProgressRequest,
     ownerEntityId?: UUID | null,
   ): Promise<LifeOpsBrowserSession>;
   completeBrowserSessionFromCompanion(

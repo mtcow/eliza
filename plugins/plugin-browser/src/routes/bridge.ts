@@ -19,8 +19,13 @@ import type http from "node:http";
 import type { ReadJsonBodyOptions } from "@elizaos/core";
 import { type AgentRuntime, logger, type UUID } from "@elizaos/core";
 import {
+  BROWSER_BRIDGE_KINDS,
   BROWSER_BRIDGE_PACKAGE_PATH_TARGETS,
   type BrowserBridgeCompanionAuthErrorCode,
+  type BrowserBridgeCompanionPreflightRequest,
+  type BrowserBridgeCompanionSessionProgressRequest,
+  type BrowserBridgeCompanionSyncRequest,
+  type BrowserBridgeKind,
   type CreateBrowserBridgeCompanionAutoPairRequest,
   type CreateBrowserBridgeCompanionPairingRequest,
   type SyncBrowserBridgeStateRequest,
@@ -44,12 +49,17 @@ import {
   type BrowserBridgeRouteService,
 } from "../service.js";
 
+function isBrowserBridgeKind(value: string): value is BrowserBridgeKind {
+  return BROWSER_BRIDGE_KINDS.some((kind) => kind === value);
+}
+
 export interface BrowserBridgeRouteContext {
   req: http.IncomingMessage;
   res: http.ServerResponse;
   method: string;
   pathname: string;
   url: URL;
+  localApiOrigin: string | null;
   state: {
     runtime: AgentRuntime | null;
     adminEntityId: UUID | null;
@@ -121,20 +131,56 @@ function getBrowserCompanionAuth(
   };
 }
 
+export function isBrowserAutoPairOriginAllowed(
+  originHeader: string,
+  localApiOrigin: string | null,
+  isLoopback: boolean,
+): boolean {
+  if (!isLoopback || !localApiOrigin) {
+    return false;
+  }
+  if (!originHeader) return true;
+  try {
+    const origin = new URL(originHeader);
+    const localApi = new URL(localApiOrigin);
+    const loopbackHost =
+      origin.hostname === "127.0.0.1" ||
+      origin.hostname === "localhost" ||
+      origin.hostname === "[::1]" ||
+      origin.hostname === "::1";
+    if (
+      loopbackHost &&
+      origin.protocol === localApi.protocol &&
+      origin.port === localApi.port
+    ) {
+      return true;
+    }
+    return (
+      (origin.protocol === "chrome-extension:" ||
+        origin.protocol === "moz-extension:" ||
+        origin.protocol === "safari-web-extension:") &&
+      origin.hostname.length > 0 &&
+      origin.username === "" &&
+      origin.password === "" &&
+      origin.pathname === "" &&
+      origin.search === "" &&
+      origin.hash === ""
+    );
+  } catch {
+    // error-policy:J3 The browser-supplied Origin is untrusted input.
+    return false;
+  }
+}
+
 function browserAutoPairOriginAllowed(ctx: BrowserBridgeRouteContext): boolean {
   const originHeader =
     typeof ctx.req.headers.origin === "string"
       ? ctx.req.headers.origin.trim()
       : "";
-  if (!originHeader) {
-    return requestIsLoopback(ctx);
-  }
-  if (originHeader === ctx.url.origin) {
-    return true;
-  }
-  return (
-    originHeader.startsWith("chrome-extension://") ||
-    originHeader.startsWith("safari-web-extension://")
+  return isBrowserAutoPairOriginAllowed(
+    originHeader,
+    ctx.localApiOrigin,
+    requestIsLoopback(ctx),
   );
 }
 
@@ -570,9 +616,14 @@ export async function handleBrowserBridgeRoutes(
     if (!browserAutoPairOriginAllowed(ctx)) {
       ctx.error(
         res,
-        "browser auto-pair must come from the agent app or a browser extension",
+        "browser auto-pair must come from the agent app or an origin-less loopback request",
         403,
       );
+      return true;
+    }
+    const localApiOrigin = ctx.localApiOrigin;
+    if (!localApiOrigin) {
+      ctx.error(res, "browser auto-pair local API origin is unavailable", 503);
       return true;
     }
     const body =
@@ -586,7 +637,7 @@ export async function handleBrowserBridgeRoutes(
         res,
         await service.autoPairBrowserCompanion(
           body,
-          ctx.url.origin,
+          localApiOrigin,
           ctx.state.adminEntityId,
         ),
         201,
@@ -701,6 +752,35 @@ export async function handleBrowserBridgeRoutes(
     });
   }
 
+  if (
+    method === "POST" &&
+    pathname === "/api/browser-bridge/companions/preflight"
+  ) {
+    if (rateLimitRequest(ctx, "companions:preflight")) return true;
+    return runRoute(ctx, async (service) => {
+      const auth = getBrowserCompanionAuth(ctx);
+      if (!auth) return;
+      const body = await readJsonBody<BrowserBridgeCompanionPreflightRequest>(
+        req,
+        res,
+      );
+      if (!body) return;
+      if (!isBrowserBridgeRouteBodyObject(body)) {
+        rejectMalformedBrowserBridgePayload(ctx);
+        return;
+      }
+      json(
+        res,
+        await service.preflightBrowserCompanion(
+          auth.companionId,
+          auth.pairingToken,
+          body,
+          ctx.state.adminEntityId,
+        ),
+      );
+    });
+  }
+
   if (method === "POST" && pathname === "/api/browser-bridge/companions/sync") {
     if (rateLimitRequest(ctx, "companions:sync")) {
       return true;
@@ -710,7 +790,10 @@ export async function handleBrowserBridgeRoutes(
       if (!auth) {
         return;
       }
-      const body = await readJsonBody<SyncBrowserBridgeStateRequest>(req, res);
+      const body = await readJsonBody<BrowserBridgeCompanionSyncRequest>(
+        req,
+        res,
+      );
       if (!body) return;
       if (!isBrowserBridgeRouteBodyObject(body)) {
         rejectMalformedBrowserBridgePayload(ctx);
@@ -748,8 +831,12 @@ export async function handleBrowserBridgeRoutes(
       "browser package target",
     );
     if (!browser) return true;
-    if (browser !== "chrome" && browser !== "safari") {
-      ctx.error(res, "browser must be chrome or safari", 400);
+    if (!isBrowserBridgeKind(browser)) {
+      ctx.error(
+        res,
+        `browser must be one of: ${BROWSER_BRIDGE_KINDS.join(", ")}`,
+        400,
+      );
       return true;
     }
     return runStatelessRoute(ctx, async () => {
@@ -779,8 +866,12 @@ export async function handleBrowserBridgeRoutes(
       "browser package target",
     );
     if (!browser) return true;
-    if (browser !== "chrome" && browser !== "safari") {
-      ctx.error(res, "browser must be chrome or safari", 400);
+    if (!isBrowserBridgeKind(browser)) {
+      ctx.error(
+        res,
+        `browser must be one of: ${BROWSER_BRIDGE_KINDS.join(", ")}`,
+        400,
+      );
       return true;
     }
     return runStatelessRoute(ctx, async () => {
@@ -800,8 +891,12 @@ export async function handleBrowserBridgeRoutes(
       "browser package target",
     );
     if (!browser) return true;
-    if (browser !== "chrome" && browser !== "safari") {
-      ctx.error(res, "browser must be chrome or safari", 400);
+    if (!isBrowserBridgeKind(browser)) {
+      ctx.error(
+        res,
+        `browser must be one of: ${BROWSER_BRIDGE_KINDS.join(", ")}`,
+        400,
+      );
       return true;
     }
     return runStatelessRoute(ctx, async () => {
@@ -1002,7 +1097,10 @@ export async function handleBrowserBridgeRoutes(
         return;
       }
       const body =
-        await readJsonBody<UpdateBrowserBridgeSessionProgressRequest>(req, res);
+        await readJsonBody<BrowserBridgeCompanionSessionProgressRequest>(
+          req,
+          res,
+        );
       if (!body) return;
       if (!isBrowserBridgeRouteBodyObject(body)) {
         rejectMalformedBrowserBridgePayload(ctx);
