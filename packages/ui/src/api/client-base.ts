@@ -89,6 +89,10 @@ const LOCAL_STORAGE_API_BASE_KEY = "elizaos_api_base";
 const DEDICATED_CLOUD_CORS_BLOCKED_HEADERS = new Set([
   "x-elizaos-client-id",
   "x-elizaos-ui-language",
+  // The baseline headers are meaningful only on the shared Worker routes and
+  // are not in the dedicated container server's CORS contract.
+  "x-elizaos-turn-correlation",
+  "x-elizaos-turn-attempt",
 ]);
 const REPLAYABLE_WS_EVENT_TYPES: ReadonlySet<string> = new Set([
   SHELL_NAVIGATE_VIEW_WS_EVENT,
@@ -757,6 +761,8 @@ const WARMING_MAX_DELAY_MS = 5_000;
 // its wait clamped to whatever budget remains, and once the deadline passes
 // the structured warming error surfaces instead of another retry.
 const WARMING_TOTAL_BUDGET_MS = 5_000;
+const SHARED_TURN_CORRELATION_HEADER = "X-ElizaOS-Turn-Correlation";
+const SHARED_TURN_ATTEMPT_HEADER = "X-ElizaOS-Turn-Attempt";
 
 /** Clamp the warming barrier's advertised `Retry-After` (seconds) into ms. */
 function warmingRetryDelayMs(retryAfterSeconds: number | undefined): number {
@@ -1366,7 +1372,17 @@ export class ElizaClient {
     let resumeRetries = 0;
     let warmingRetries = 0;
     let warmingDeadline: number | null = null;
-    let res = await this.rawRequestOnce(path, requestUrl, init, options, token);
+    let requestAttempt = 0;
+    const requestOnce = () =>
+      this.rawRequestOnce(
+        path,
+        requestUrl,
+        init,
+        options,
+        token,
+        ++requestAttempt,
+      );
+    let res = await requestOnce();
     // Personal-Eliza cutover repoint happens once, before classification: a
     // structural Shared rejection can rebind this client to the dedicated
     // runtime, after which the re-issued request (fresh base/url/token) enters
@@ -1382,7 +1398,7 @@ export class ElizaClient {
       requestBase = this.baseUrl;
       requestUrl = this.rawRequestUrl(path);
       token = this.apiToken;
-      res = await this.rawRequestOnce(path, requestUrl, init, options, token);
+      res = await requestOnce();
     }
     while (true) {
       // 401: one token refresh per logical request, wherever in the retry
@@ -1396,13 +1412,7 @@ export class ElizaClient {
         const retryToken = hydratedToken ?? (!token ? this.apiToken : null);
         if (retryToken && retryToken !== token) {
           token = retryToken;
-          res = await this.rawRequestOnce(
-            path,
-            requestUrl,
-            init,
-            options,
-            token,
-          );
+          res = await requestOnce();
           continue;
         }
       }
@@ -1420,13 +1430,7 @@ export class ElizaClient {
           await sleepUnlessAborted(resumeRetryDelayMs(res), init?.signal);
           if (!init?.signal?.aborted) {
             resumeRetries += 1;
-            res = await this.rawRequestOnce(
-              path,
-              requestUrl,
-              init,
-              options,
-              token,
-            );
+            res = await requestOnce();
             continue;
           }
         }
@@ -1529,13 +1533,7 @@ export class ElizaClient {
           );
           await sleepUnlessAborted(delay, init?.signal);
           if (!init?.signal?.aborted) {
-            res = await this.rawRequestOnce(
-              path,
-              requestUrl,
-              init,
-              options,
-              token,
-            );
+            res = await requestOnce();
             continue;
           }
         }
@@ -1663,6 +1661,7 @@ export class ElizaClient {
     init: RequestInit | undefined,
     options: { allowNonOk?: boolean; timeoutMs?: number } | undefined,
     token: string | null,
+    requestAttempt: number,
   ): Promise<Response> {
     const timeoutMs = options?.timeoutMs ?? defaultFetchTimeoutMs(path, init);
     const abortController = new AbortController();
@@ -1692,6 +1691,7 @@ export class ElizaClient {
         abortController,
         token,
         requestUrl,
+        requestAttempt,
       );
       const transport = await this.rawRequestTransport(requestUrl);
       return await transport.request(requestUrl, requestInit, { timeoutMs });
@@ -1718,6 +1718,7 @@ export class ElizaClient {
     abortController: AbortController,
     token: string | null,
     requestUrl: string,
+    requestAttempt: number,
   ): RequestInit {
     const isDedicatedCloudRequest = isDedicatedCloudAgentBase(requestUrl);
     const headers: Record<string, string> = {
@@ -1730,6 +1731,10 @@ export class ElizaClient {
         : {}),
       ...requestHeadersToRecord(init?.headers),
     };
+    const correlation = headers[SHARED_TURN_CORRELATION_HEADER];
+    if (correlation) {
+      headers[SHARED_TURN_ATTEMPT_HEADER] = String(requestAttempt);
+    }
     if (isDedicatedCloudRequest) {
       for (const key of Object.keys(headers)) {
         if (DEDICATED_CLOUD_CORS_BLOCKED_HEADERS.has(key.toLowerCase())) {
@@ -2631,6 +2636,14 @@ export class ElizaClient {
         headers: {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
+          ...(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            resolvedClientMessageId,
+          )
+            ? {
+                [SHARED_TURN_CORRELATION_HEADER]:
+                  resolvedClientMessageId.toLowerCase(),
+              }
+            : {}),
         },
         body: JSON.stringify({
           text,

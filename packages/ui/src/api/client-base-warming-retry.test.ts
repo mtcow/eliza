@@ -73,6 +73,50 @@ describe("ElizaClient warming 503 absorption (#18045)", () => {
     expect(out).toEqual(expect.objectContaining({ ok: true }));
   });
 
+  it("marks the first shared turn and each absorbed warming retry", async () => {
+    const request = vi
+      .fn<AgentRequestTransport["request"]>()
+      .mockResolvedValueOnce(warming503("shared_runtime_cache_warming"))
+      .mockResolvedValueOnce(
+        new Response('event: done\ndata: {"text":"ok"}\n\n', {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    const client = makeClient(request);
+    const pending = client.streamChatEndpoint(
+      "/api/conversations/c-1/messages/stream",
+      "hi",
+      () => undefined,
+      "DM",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+    await vi.runAllTimersAsync();
+    await pending;
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(
+      new Headers(request.mock.calls[0]?.[1]?.headers).get(
+        "X-ElizaOS-Turn-Correlation",
+      ),
+    ).toBe("123e4567-e89b-42d3-a456-426614174000");
+    expect(
+      new Headers(request.mock.calls[0]?.[1]?.headers).get(
+        "X-ElizaOS-Turn-Attempt",
+      ),
+    ).toBe("1");
+    expect(
+      new Headers(request.mock.calls[1]?.[1]?.headers).get(
+        "X-ElizaOS-Turn-Attempt",
+      ),
+    ).toBe("2");
+  });
+
   it("does not retry a generic 503 without a warming code", async () => {
     const request = vi
       .fn<AgentRequestTransport["request"]>()

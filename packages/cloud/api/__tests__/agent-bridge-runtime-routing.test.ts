@@ -1,5 +1,13 @@
 // Exercises cloud API tests agent bridge runtime routing.test behavior with deterministic Worker route fixtures.
-import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import {
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
 
 const requireAuthOrApiKeyWithOrg =
   mock<
@@ -83,6 +91,50 @@ const executionCtx = {
 };
 
 describe("agent bridge runtime routing", () => {
+  test("records an allow-listed bridge method and first logical attempt on early warming", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const response = await bridgeRoute.default.request(
+        "/",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-ElizaOS-Turn-Correlation":
+              "123e4567-e89b-42d3-a456-426614174000",
+            "X-ElizaOS-Turn-Attempt": "1",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "rpc-1",
+            method: "message.send",
+            params: { text: "not logged" },
+          }),
+        },
+        staleControlPlaneContext().env,
+        executionCtx as never,
+      );
+
+      expect(response.status).toBe(503);
+      expect(warn).toHaveBeenCalledWith(
+        "[shared-turn baseline] request completed",
+        {
+          surface: "bridge",
+          rpcMethod: "message.send",
+          runtimeKind: "unresolved",
+          status: 503,
+          outcome: "other_error",
+          logicalTurn: "123e4567-e89b-42d3-a456-426614174000",
+          attempt: 1,
+          attemptKind: "first",
+        },
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("not logged");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test("bridge fails closed without the conversation coordinator", async () => {
     globalThis.fetch = deadControlPlaneFetch as unknown as typeof fetch;
 
