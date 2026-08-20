@@ -147,7 +147,58 @@ describe("classifyDestructiveCommand — must NOT fire", () => {
     ["ampersand", "printf 'safe & rm -rf ./data'"],
     ["escaped ampersand", "printf safe \\& rm -rf ./data"],
     ["escaped line feed", "printf safe \\\nrm -rf ./data"],
-  ])("quoted %s content remains one benign segment", (_name, command) => {
+    ["file-descriptor redirect", "echo ok 2>&1"],
+    ["combined output redirect", "printf ok &> ./out"],
+    ["CRLF quoted content", "printf 'safe\r\nrm -rf ./data'"],
+    ["escaped double quote", String.raw`printf "safe \"rm -rf ./data\""`],
+  ])("%s remains one benign segment", (_name, command) => {
     expect(classifyDestructiveCommand(command).destructive).toBe(false);
+  });
+
+  it.each([
+    ["unquoted", "cat <<EOF\nrm -rf ./data\nEOF"],
+    ["single-quoted", "cat <<'EOF'\nrm -rf ./data\nEOF"],
+    ["double-quoted", 'cat <<"EOF"\nDROP DATABASE production\nEOF'],
+    ["concatenated quoted word", "cat <<'E'OF\nrm -rf ./data\nEOF"],
+    ["tab-stripped", "cat <<-EOF\n\trm -rf ./data\n\tEOF"],
+  ])(
+    "%s heredoc payload is data, not an executable segment",
+    (_name, command) => {
+      expect(classifyDestructiveCommand(command).destructive).toBe(false);
+    },
+  );
+
+  it("resumes classification after a heredoc terminator", () => {
+    expect(
+      classifyDestructiveCommand(
+        "cat <<EOF\nrm -rf ./data\nEOF\nrm -rf ./cache",
+      ),
+    ).toMatchObject({
+      destructive: true,
+      reason: "recursive delete",
+      targets: ["./cache"],
+    });
+  });
+
+  it.each([
+    ["expansion", "echo $((1 << 2))\nrm -rf ./data"],
+    ["command", "(( flags << 1 ))\nrm -rf ./data"],
+  ])("does not mistake an arithmetic %s for a heredoc", (_name, command) => {
+    expect(classifyDestructiveCommand(command)).toMatchObject({
+      destructive: true,
+      reason: "recursive delete",
+      targets: ["./data"],
+    });
+  });
+
+  it.each([
+    ["semicolon", "echo hi;# cat <<EOF\nrm -rf ./data\nEOF"],
+    ["background operator", "echo hi &# cat <<EOF\nrm -rf ./data\nEOF"],
+  ])("ignores a fake heredoc in a comment after a %s", (_name, command) => {
+    expect(classifyDestructiveCommand(command)).toMatchObject({
+      destructive: true,
+      reason: "recursive delete",
+      targets: ["./data"],
+    });
   });
 });

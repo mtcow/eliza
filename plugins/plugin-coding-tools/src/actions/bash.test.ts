@@ -3243,6 +3243,22 @@ describe("destructive-bulk confirm gate", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "does not gate destructive-looking heredoc data",
+    async () => {
+      const { runtime } = await makeRuntime();
+      const result = await shellAction.handler?.(
+        runtime,
+        makeMessage(undefined, "print this example without running it"),
+        undefined,
+        { command: "cat <<'EOF'\nrm -rf ./data\nEOF" },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.text).toContain("rm -rf ./data");
+    },
+  );
+
   it("runs the same command when confirm=true", async () => {
     const { command, target } = await createRecursiveDeleteCommand();
     const { runtime } = await makeRuntime();

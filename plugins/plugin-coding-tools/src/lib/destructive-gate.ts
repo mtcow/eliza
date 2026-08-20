@@ -68,6 +68,132 @@ const POWERSHELL_REMOVE_ITEM_BINS = new Set([
 const DESTRUCTIVE_BINS = new Set(["mkfs", "shred", "wipefs"]);
 const DROP_SQL = /\bdrop\s+(database|table|schema)\s+(\S+)/i;
 
+interface HeredocDeclaration {
+  delimiter: string;
+  stripTabs: boolean;
+}
+
+function parseHeredocDelimiter(line: string, start: number): string | null {
+  let cursor = start;
+  let delimiter = "";
+  let quote: string | null = null;
+
+  while (cursor < line.length) {
+    const ch = line[cursor] as string;
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+        cursor += 1;
+        continue;
+      }
+      if (
+        quote === '"' &&
+        ch === "\\" &&
+        cursor + 1 < line.length &&
+        /[$`"\\]/.test(line[cursor + 1] as string)
+      ) {
+        cursor += 1;
+      }
+      delimiter += line[cursor] as string;
+      cursor += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cursor += 1;
+      continue;
+    }
+    if (ch === "\\" && cursor + 1 < line.length) {
+      cursor += 1;
+      delimiter += line[cursor] as string;
+      cursor += 1;
+      continue;
+    }
+    if (/[\s|;&<>()]/.test(ch)) break;
+    delimiter += ch;
+    cursor += 1;
+  }
+
+  return quote === null && delimiter ? delimiter : null;
+}
+
+function heredocDeclarations(line: string): HeredocDeclaration[] {
+  const declarations: HeredocDeclaration[] = [];
+  let arithmeticDepth = 0;
+  let quote: string | null = null;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i] as string;
+    if (quote) {
+      if (quote === '"' && ch === "\\" && i + 1 < line.length) i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < line.length) {
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(" && line[i + 1] === "(") {
+      arithmeticDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (arithmeticDepth > 0 && ch === ")" && line[i + 1] === ")") {
+      arithmeticDepth -= 1;
+      i += 1;
+      continue;
+    }
+    if (arithmeticDepth > 0) continue;
+    if (ch === "#" && (i === 0 || /[\s;|&()]/.test(line[i - 1] as string)))
+      break;
+    if (ch !== "<" || line[i + 1] !== "<" || line[i + 2] === "<") continue;
+
+    let cursor = i + 2;
+    const stripTabs = line[cursor] === "-";
+    if (stripTabs) cursor += 1;
+    while (line[cursor] === " " || line[cursor] === "\t") cursor += 1;
+
+    const delimiter = parseHeredocDelimiter(line, cursor);
+    if (delimiter !== null) declarations.push({ delimiter, stripTabs });
+  }
+  return declarations;
+}
+
+// Heredoc bodies are shell input, not commands. Preserve their newlines so
+// later executable lines remain segment boundaries, but hide payload bytes
+// from both the command and SQL classifiers.
+function maskHeredocBodies(command: string): string {
+  const lines = command.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) ?? [];
+  const pending: HeredocDeclaration[] = [];
+
+  return lines
+    .map((line) => {
+      const newline = line.endsWith("\r\n")
+        ? "\r\n"
+        : line.endsWith("\n")
+          ? "\n"
+          : line.endsWith("\r")
+            ? "\r"
+            : "";
+      const content = newline ? line.slice(0, -newline.length) : line;
+      const active = pending[0];
+      if (active) {
+        const comparable = active.stripTabs
+          ? content.replace(/^\t+/, "")
+          : content;
+        if (comparable === active.delimiter) pending.shift();
+        return `${" ".repeat(content.length)}${newline}`;
+      }
+      pending.push(...heredocDeclarations(content));
+      return line;
+    })
+    .join("");
+}
+
 function splitSegments(command: string): string[] {
   // Split shell list/pipeline operators while retaining quoted or backslash-
   // escaped characters in their current segment.
@@ -116,7 +242,8 @@ function tokens(segment: string): string[] {
 export function classifyDestructiveCommand(
   command: string,
 ): DestructiveVerdict {
-  const sql = DROP_SQL.exec(command);
+  const executableCommand = maskHeredocBodies(command);
+  const sql = DROP_SQL.exec(executableCommand);
   if (sql) {
     return {
       destructive: true,
@@ -124,7 +251,7 @@ export function classifyDestructiveCommand(
       targets: [sql[2] ?? ""],
     };
   }
-  for (const segment of splitSegments(command)) {
+  for (const segment of splitSegments(executableCommand)) {
     const argv = tokens(segment);
     // env-var prefixes (FOO=bar cmd …) precede the executable
     let i = 0;
