@@ -202,7 +202,6 @@ export function applyCors(
       "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     );
     res.setHeader("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
   }
 
   // Security headers
@@ -439,7 +438,7 @@ export function ensureApiTokenForBindHost(host: string): void {
 
   // M7 (#12228): a wildcard bind (0.0.0.0 / ::) relaxes both the DNS-rebind
   // Host check (`hostAllowed`) and the CORS origin check (`resolveCorsOrigin`
-  // reflects any origin with credentials). With ELIZA_DISABLE_AUTO_API_TOKEN=1
+  // reflects any origin). With ELIZA_DISABLE_AUTO_API_TOKEN=1
   // and no explicit ELIZA_API_TOKEN that leaves the server listening on every
   // interface with *no* authenticated boundary and both browser-origin
   // protections off — silently wide open. Refuse to honor the disable flag in

@@ -63,7 +63,7 @@ describe("applyCors", () => {
     expect(res.headers.get("Access-Control-Allow-Headers")).toBe(
       CORS_ALLOWED_HEADERS,
     );
-    expect(res.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+    expect(res.headers.get("Access-Control-Allow-Credentials")).toBeUndefined();
     expect(res.headers.get("Access-Control-Allow-Methods")).toBe(
       "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     );
@@ -75,6 +75,24 @@ describe("applyCors", () => {
     expect(allowedHeaders).toContain("X-ElizaOS-UI-Language");
     expect(allowedHeaders).toContain("X-ElizaOS-Token");
     expect(allowedHeaders).toContain("X-Waifu-Chat-Access-Token");
+  });
+
+  it("never enables ambient browser credentials for reflected cloud origins", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    const res = new HeaderCapture();
+
+    expect(
+      applyCors(
+        requestWithOrigin("https://untrusted.example"),
+        res,
+        "/api/status",
+      ),
+    ).toBe(true);
+
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://untrusted.example",
+    );
+    expect(res.headers.get("Access-Control-Allow-Credentials")).toBeUndefined();
   });
 
   it("allows waifu token-page iframe ancestors when hosted chat JWT auth is enabled", () => {
