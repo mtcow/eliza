@@ -543,6 +543,12 @@ async function executeMeasuredSharedElizaRuntimeTurn(
   timing: SharedRuntimeTimingCollector,
   exposeRuntime: (runtime: IAgentRuntime) => void,
 ): Promise<RunSharedAgentTurnResult> {
+  if (typeof input.execution.roomKey !== "string" || !input.execution.roomKey.trim()) {
+    throw new Error(
+      "Eliza Shared runtime requires a trusted room key when execution authority is provided",
+    );
+  }
+  const trustedRoomKey = input.execution.roomKey.trim();
   await ensureEdgeStreamingContext();
   timing.markEdgeContextReady();
   const adapter = new InMemoryDatabaseAdapter();
@@ -755,12 +761,12 @@ async function executeMeasuredSharedElizaRuntimeTurn(
         throw new Error("Eliza Shared runtime initialized without its GENERATE_MEDIA action");
       }
     }
-    const roomId = sharedRuntimeConversationRoomId(input.agentKey);
+    const roomId = sharedRuntimeConversationRoomId(trustedRoomKey);
     timing.markConnectionStarted();
     await runtime.ensureConnection({
       entityId: incomingEntityId,
       roomId,
-      worldId: sharedRuntimeWorldId(input.agentKey),
+      worldId: sharedRuntimeWorldId(trustedRoomKey),
       userName: actionsEnabled ? "Shared user" : "Shared lifecycle",
       source: actionsEnabled ? input.execution.channel.source : "shared-runtime-system",
       type: input.execution.channel.type,

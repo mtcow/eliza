@@ -4312,6 +4312,7 @@ export class ElizaSandboxService {
         message: text,
         execution: {
           agentKey: rec.id,
+          roomKey: channelId,
           channel: { type: ChannelType.DM, source: "shared-runtime" },
         },
       });
@@ -4478,6 +4479,7 @@ export class ElizaSandboxService {
         message: text,
         execution: {
           agentKey: rec.id,
+          roomKey: channelId,
           channel: { type: ChannelType.DM, source: "shared-runtime" },
         },
       });

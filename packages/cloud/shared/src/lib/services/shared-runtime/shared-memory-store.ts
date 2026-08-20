@@ -4,9 +4,9 @@
  * is mirrored into the tenant-scoped `shared_agent_memories` table with the
  * SAME storage identities the ephemeral Workerd runtime projects (agent/entity
  * uuids from the Todo storage scope when present, room/world derived from the
- * agent key) — so a later Dedicated cutover or retrieval pass reads rows that
- * line up with what the runtime actually saw. Off (the default), the store is
- * never constructed and the turn path is byte-identical to before.
+ * trusted conversation key) — so a later Dedicated cutover or retrieval pass
+ * reads rows that line up with what the runtime actually saw. Off (the default),
+ * the store is never constructed and the turn path is byte-identical to before.
  */
 
 import { stringToUuid, validateUuid } from "@elizaos/core/edge";
@@ -40,6 +40,11 @@ export interface SharedMemoryStoreScope {
   userId: string;
   /** Logical Shared agent id (`agent.id`), the seed for storage identities. */
   agentKey: string;
+  /**
+   * Canonical channel id selected by the authenticated request path. Caller
+   * room labels are normalized and hashed before this storage scope is built.
+   */
+  roomKey: string;
   /** Storage uuids shared with the runtime's Todo scope, when Todos are wired. */
   storage?: SharedTodoStorageScope;
 }
@@ -73,12 +78,20 @@ export interface SharedMemoryEmbedConfig {
 }
 
 export class SharedMemoryStore {
+  private readonly canonicalRoomKey: string;
+
   constructor(
     private readonly scope: SharedMemoryStoreScope,
     private readonly writer: SharedAgentMemoriesWriter = sharedAgentMemoriesWriter,
     private readonly reader: SharedAgentMemoriesReader = sharedAgentMemoriesReader,
     private readonly embed?: SharedMemoryEmbedConfig,
-  ) {}
+  ) {
+    const canonicalRoomKey = typeof scope.roomKey === "string" ? scope.roomKey.trim() : "";
+    if (!canonicalRoomKey) {
+      throw new Error("Shared memory store requires a trusted room key");
+    }
+    this.canonicalRoomKey = canonicalRoomKey;
+  }
 
   /**
    * Tenant-scoped vector search over this store's transcript rows (P3 recall's
@@ -90,12 +103,14 @@ export class SharedMemoryStore {
     limit: number,
   ): Promise<SharedAgentMemorySearchHit[]> {
     const agentId = this.scope.storage?.agentId ?? stringToUuid(this.scope.agentKey);
+    const roomId = sharedRuntimeConversationRoomId(this.canonicalRoomKey);
     return this.reader.searchByEmbedding(
       {
         organizationId: this.scope.organizationId,
         userId: this.scope.userId,
         agentId,
       },
+      roomId,
       embedding,
       limit,
     );
@@ -109,8 +124,8 @@ export class SharedMemoryStore {
   async recordTurnPair(pair: SharedMemoryTurnPair): Promise<void> {
     const agentId = this.scope.storage?.agentId ?? stringToUuid(this.scope.agentKey);
     const entityId = this.scope.storage?.entityId ?? stringToUuid(`${this.scope.agentKey}:owner`);
-    const roomId = sharedRuntimeConversationRoomId(this.scope.agentKey);
-    const worldId = sharedRuntimeWorldId(this.scope.agentKey);
+    const roomId = sharedRuntimeConversationRoomId(this.canonicalRoomKey);
+    const worldId = sharedRuntimeWorldId(this.canonicalRoomKey);
     const scope = {
       organizationId: this.scope.organizationId,
       userId: this.scope.userId,

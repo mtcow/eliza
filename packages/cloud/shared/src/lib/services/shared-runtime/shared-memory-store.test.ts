@@ -10,6 +10,7 @@ import { stringToUuid } from "@elizaos/core/edge";
 import type {
   InsertSharedAgentMemoryInput,
   MergeSharedAgentMessageMemoryInput,
+  SharedAgentMemoriesReader,
   SharedAgentMemoriesWriter,
 } from "../../../db/repositories/shared-agent-memories";
 import {
@@ -26,6 +27,7 @@ import {
 const ORG = "5a5c62c4-51b6-4e94-8c4e-a41d62b85e2f";
 const USER = "9a3d9f2e-97ab-46be-a687-3a4f2f6bfa53";
 const AGENT_KEY = "agent-shared-42";
+const ROOM_KEY = "trusted-room-7";
 
 function scriptedWriter(behavior?: { failOn?: number }): {
   writer: SharedAgentMemoriesWriter;
@@ -72,11 +74,21 @@ describe("sharedMemoryTablesEnabled / createSharedMemoryStore", () => {
 
     process.env.SHARED_MEMORY_TABLES_ENABLED = "false";
     expect(
-      createSharedMemoryStore({ organizationId: ORG, userId: USER, agentKey: AGENT_KEY }),
+      createSharedMemoryStore({
+        organizationId: ORG,
+        userId: USER,
+        agentKey: AGENT_KEY,
+        roomKey: ROOM_KEY,
+      }),
     ).toBeNull();
     process.env.SHARED_MEMORY_TABLES_ENABLED = "true";
     expect(
-      createSharedMemoryStore({ organizationId: ORG, userId: USER, agentKey: AGENT_KEY }),
+      createSharedMemoryStore({
+        organizationId: ORG,
+        userId: USER,
+        agentKey: AGENT_KEY,
+        roomKey: ROOM_KEY,
+      }),
     ).toBeInstanceOf(SharedMemoryStore);
   });
 });
@@ -86,7 +98,7 @@ describe("SharedMemoryStore.recordTurnPair", () => {
     const { writer, inserts } = scriptedWriter();
     const storage = sharedTodoStorageScope({ sourceAgentId: AGENT_KEY, ownerId: USER });
     const store = new SharedMemoryStore(
-      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, storage },
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: ROOM_KEY, storage },
       writer,
     );
     const messageIds = {
@@ -107,8 +119,8 @@ describe("SharedMemoryStore.recordTurnPair", () => {
         userId: USER,
         agentId: storage.agentId,
       });
-      expect(row?.roomId).toBe(sharedRuntimeConversationRoomId(AGENT_KEY));
-      expect(row?.worldId).toBe(sharedRuntimeWorldId(AGENT_KEY));
+      expect(row?.roomId).toBe(sharedRuntimeConversationRoomId(ROOM_KEY));
+      expect(row?.worldId).toBe(sharedRuntimeWorldId(ROOM_KEY));
       expect(row?.type).toBe("messages");
     }
     expect(userRow?.id).toBe(messageIds.user);
@@ -132,7 +144,7 @@ describe("SharedMemoryStore.recordTurnPair", () => {
   test("derives deterministic fallback identities without a Todo storage scope", async () => {
     const { writer, inserts } = scriptedWriter();
     const store = new SharedMemoryStore(
-      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY },
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: ROOM_KEY },
       writer,
     );
     await store.recordTurnPair({
@@ -153,7 +165,7 @@ describe("SharedMemoryStore.recordTurnPair", () => {
   test("mirrors interrupted history and omits an unseen empty assistant row", async () => {
     const interrupted = scriptedWriter();
     const store = new SharedMemoryStore(
-      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY },
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: ROOM_KEY },
       interrupted.writer,
     );
     await store.recordTurnPair({
@@ -170,7 +182,7 @@ describe("SharedMemoryStore.recordTurnPair", () => {
 
     const empty = scriptedWriter();
     const emptyStore = new SharedMemoryStore(
-      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY },
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: ROOM_KEY },
       empty.writer,
     );
     await emptyStore.recordTurnPair({
@@ -185,7 +197,7 @@ describe("SharedMemoryStore.recordTurnPair", () => {
   test("omits row ids without transport ids and propagates storage failures", async () => {
     const unkeyed = scriptedWriter();
     const store = new SharedMemoryStore(
-      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY },
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: ROOM_KEY },
       unkeyed.writer,
     );
     await store.recordTurnPair({ userMessage: "no ids", assistantReply: "still lands" });
@@ -194,7 +206,7 @@ describe("SharedMemoryStore.recordTurnPair", () => {
 
     const failing = scriptedWriter({ failOn: 2 });
     const failingStore = new SharedMemoryStore(
-      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY },
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: ROOM_KEY },
       failing.writer,
     );
     await expect(
@@ -202,5 +214,50 @@ describe("SharedMemoryStore.recordTurnPair", () => {
     ).rejects.toThrow("scripted storage failure");
     // Sequential writes: the user row landed before the failure surfaced.
     expect(failing.inserts).toHaveLength(2);
+  });
+});
+
+describe("SharedMemoryStore.searchByEmbedding", () => {
+  test("canonicalizes a padded trusted room once for writes and recall", async () => {
+    const calls: unknown[][] = [];
+    const reader = {
+      searchByEmbedding: async (...args: unknown[]) => {
+        calls.push(args);
+        return [];
+      },
+    } as unknown as SharedAgentMemoriesReader;
+    const { writer, inserts } = scriptedWriter();
+    const store = new SharedMemoryStore(
+      { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: `  ${ROOM_KEY}  ` },
+      writer,
+      reader,
+    );
+
+    await expect(store.searchByEmbedding([1, 0, 0], 4)).resolves.toEqual([]);
+    await store.recordTurnPair({ userMessage: "remember", assistantReply: "recalled" });
+    expect(calls).toEqual([
+      [
+        { organizationId: ORG, userId: USER, agentId: stringToUuid(AGENT_KEY) },
+        sharedRuntimeConversationRoomId(ROOM_KEY),
+        [1, 0, 0],
+        4,
+      ],
+    ]);
+    expect(inserts).toHaveLength(2);
+    for (const row of inserts) {
+      expect(row.roomId).toBe(sharedRuntimeConversationRoomId(ROOM_KEY));
+      expect(row.worldId).toBe(sharedRuntimeWorldId(ROOM_KEY));
+    }
+  });
+
+  test("rejects construction without a trusted room key", () => {
+    const { writer } = scriptedWriter();
+    expect(
+      () =>
+        new SharedMemoryStore(
+          { organizationId: ORG, userId: USER, agentKey: AGENT_KEY, roomKey: " " },
+          writer,
+        ),
+    ).toThrow("trusted room key");
   });
 });
