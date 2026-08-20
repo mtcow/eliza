@@ -764,6 +764,20 @@ const WARMING_TOTAL_BUDGET_MS = 5_000;
 const SHARED_TURN_CORRELATION_HEADER = "X-ElizaOS-Turn-Correlation";
 const SHARED_TURN_ATTEMPT_HEADER = "X-ElizaOS-Turn-Attempt";
 
+function generateSharedTurnCorrelation(): string | null {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID().toLowerCase();
+  }
+  if (typeof globalThis.crypto?.getRandomValues !== "function") return null;
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
+    .slice(6, 8)
+    .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
+
 /** Clamp the warming barrier's advertised `Retry-After` (seconds) into ms. */
 function warmingRetryDelayMs(retryAfterSeconds: number | undefined): number {
   const ms =
@@ -2629,6 +2643,10 @@ export class ElizaClient {
     // takes precedence so the retry is idempotent with the original attempt.
     const resolvedClientMessageId =
       clientMessageId ?? ElizaClient.generateMessageId();
+    // This identifier exists only for short-lived attempt telemetry. Keep it
+    // separate from the persisted/idempotent message ID so natural logs cannot
+    // be joined back to message records or caller-supplied identifiers.
+    const turnCorrelation = generateSharedTurnCorrelation();
     const res = await this.rawRequest(
       path,
       {
@@ -2636,12 +2654,9 @@ export class ElizaClient {
         headers: {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
-          ...(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-            resolvedClientMessageId,
-          )
+          ...(turnCorrelation
             ? {
-                [SHARED_TURN_CORRELATION_HEADER]:
-                  resolvedClientMessageId.toLowerCase(),
+                [SHARED_TURN_CORRELATION_HEADER]: turnCorrelation,
               }
             : {}),
         },

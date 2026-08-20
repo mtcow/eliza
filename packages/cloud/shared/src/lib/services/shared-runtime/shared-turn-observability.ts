@@ -13,6 +13,8 @@ export const SHARED_TURN_ATTEMPT_HEADER = "X-ElizaOS-Turn-Attempt";
 
 const OPAQUE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_RECORDED_ATTEMPT = 100;
+const MAX_BRIDGE_METHOD_BODY_BYTES = 64 * 1024;
+const MAX_OUTCOME_BODY_BYTES = 16 * 1024;
 
 export type SharedTurnSurface = "bridge" | "stream";
 export type SharedTurnRuntimeKind = "sandbox" | "personal" | "dedicated" | "unresolved";
@@ -30,21 +32,65 @@ export function classifySharedTurnRpcMethod(value: unknown): SharedTurnRpcMethod
   return typeof value === "string" ? "other" : "invalid";
 }
 
+async function readBoundedJsonObject(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+): Promise<Record<string, unknown> | null> {
+  if (!body) return null;
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      byteLength += chunk.value.byteLength;
+      if (byteLength > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(chunk.value);
+    }
+    const bytes = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    // error-policy:J3 malformed, unreadable, or over-budget diagnostic bodies
+    // have no measurable classification; request dispatch remains authoritative.
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export async function classifyBridgeRequestMethod(request: Request): Promise<SharedTurnRpcMethod> {
-  const body = (await request
-    .clone()
-    .json()
-    .catch(() => null)) as { method?: unknown } | null;
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = await readBoundedJsonObject(request.clone().body, MAX_BRIDGE_METHOD_BODY_BYTES);
+  } catch {
+    // error-policy:J3 a consumed or otherwise unclonable request has no safe
+    // diagnostic method classification and must not fail the real dispatch.
+  }
   return classifySharedTurnRpcMethod(body?.method);
 }
 
 export async function classifySharedTurnOutcome(response: Response): Promise<SharedTurnOutcome> {
   if (response.ok) return "success";
   if (response.status !== 503) return "other_error";
-  const body = (await response
-    .clone()
-    .json()
-    .catch(() => null)) as { code?: unknown } | null;
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = await readBoundedJsonObject(response.clone().body, MAX_OUTCOME_BODY_BYTES);
+  } catch {
+    // error-policy:J3 an unclonable response has no safe diagnostic outcome;
+    // the original response remains untouched for its caller.
+  }
   return body?.code === "agent_cache_warming" || body?.code === "shared_runtime_cache_warming"
     ? body.code
     : "other_error";

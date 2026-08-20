@@ -50,6 +50,18 @@ describe("shared-turn observability", () => {
     expect(await request.json()).toEqual({ method: "status.get" });
   });
 
+  test("bounds bridge method inspection without consuming the dispatched request", async () => {
+    const request = new Request("https://api.test/bridge", {
+      method: "POST",
+      body: JSON.stringify({
+        method: "message.send",
+        params: { text: "x".repeat(65 * 1024) },
+      }),
+    });
+    expect(await classifyBridgeRequestMethod(request)).toBe("invalid");
+    expect(await request.json()).toMatchObject({ method: "message.send" });
+  });
+
   test("classifies only named warming outcomes from error responses", async () => {
     const warming = Response.json(
       { code: "shared_runtime_cache_warming", secret: "not logged" },
@@ -65,6 +77,14 @@ describe("shared-turn observability", () => {
       ),
     ).toBe("other_error");
     expect(await classifySharedTurnOutcome(new Response("ok"))).toBe("success");
+    expect(
+      await classifySharedTurnOutcome(
+        Response.json(
+          { code: "shared_runtime_cache_warming", padding: "x".repeat(17 * 1024) },
+          { status: 503 },
+        ),
+      ),
+    ).toBe("other_error");
   });
 
   test("emits one queryable record without request payload or arbitrary headers", () => {
