@@ -652,13 +652,16 @@ class StewardClient {
     );
   }
 
-  async deleteTenant(tenantId: string): Promise<void> {
+  async deleteTenant(
+    tenantId: string,
+    phase: Phase = "cleanup",
+  ): Promise<void> {
     const response = await fetchWithTimeout(
       this.fetchImpl,
       this.url(`/platform/tenants/${encodeURIComponent(tenantId)}`),
       { method: "DELETE", headers: platformHeaders(this.config.platformKey) },
     );
-    await expectStatus(response, [200, 404], "cleanup", "tenant_delete_failed");
+    await expectStatus(response, [200, 404], phase, "tenant_delete_failed");
   }
 }
 
@@ -1092,6 +1095,7 @@ async function runProviderPersonalLifecycleProbe(
   await steward.assertUserPresent(session.userId, true);
   await steward.setDeactivated(session.userId, false);
   await steward.assertUserPresent(session.userId, false);
+  await steward.deleteTenant(`personal-${session.userId}`, "provider_probe");
   await steward.deleteUser(session.userId, "provider_probe");
   await steward.assertUserAbsent(session.userId, "provider_probe");
   await steward.assertTenantMissing(
@@ -1124,12 +1128,8 @@ async function cleanupProviderUser(
   steward: StewardClient,
   userId: string,
 ): Promise<void> {
-  try {
-    await steward.deleteUser(userId);
-  } catch {
-    await steward.deleteTenant(`personal-${userId}`);
-    await steward.deleteUser(userId);
-  }
+  await steward.deleteTenant(`personal-${userId}`);
+  await steward.deleteUser(userId);
 }
 
 export interface AccountDeletionStagingCanaryOptions {

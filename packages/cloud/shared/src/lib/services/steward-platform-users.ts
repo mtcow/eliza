@@ -152,9 +152,34 @@ export async function deactivateStewardPlatformUser(
   });
 }
 
-/** Permanently removes the Steward identity after the Cloud retention window. */
+async function deleteStewardPersonalTenant(userId: string): Promise<void> {
+  const tenantId = `personal-${userId}`;
+  const response = await fetch(
+    `${getStewardApiUrl()}/platform/tenants/${encodeURIComponent(tenantId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Steward-Platform-Key": getStewardPlatformKey(),
+      },
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  if (response.status === 404) return;
+  const payload = await readStewardPlatformUserResponse(response);
+  if (!response.ok || !payload.ok) {
+    const message =
+      "error" in payload && typeof payload.error === "string"
+        ? payload.error
+        : `Steward personal tenant deletion returned ${response.status}`;
+    throw new Error(message);
+  }
+}
+
+/** Permanently removes the Steward personal tenant and identity in that order. */
 export async function deleteStewardPlatformUser(
   userId: string,
 ): Promise<StewardPlatformUserLifecycleResult> {
+  await deleteStewardPersonalTenant(userId);
   return await mutateStewardPlatformUser(userId, "DELETE");
 }
