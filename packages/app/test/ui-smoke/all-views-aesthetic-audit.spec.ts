@@ -1855,6 +1855,12 @@ test.describe("all-views aesthetic audit (#8796)", () => {
           overlayRequired,
         );
         await settleHomeEntrance(page);
+        if (view.slug === "builtin-chat") {
+          await expect(
+            page.getByTestId("chat-sheet"),
+            "a completed-user cold boot must leave ambient chat at rest",
+          ).toHaveAttribute("data-chat-state", "INPUT");
+        }
         const { readableChars, semanticReady, overlayPresent } = paint;
         const renderStateIssues = [
           ...loadingRenderStateIssues(paint),
