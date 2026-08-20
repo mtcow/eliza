@@ -1159,13 +1159,47 @@ describe("cloud-apps surface request inference", () => {
 		}
 	});
 
-	it("falls back to local APP when no cloud-apps action is registered", () => {
+	it("never degrades a cloud-qualified ask to local APP when no cloud-apps action is registered (#17363)", () => {
 		expect(
 			inferDirectCurrentRequestCandidateActions(
 				[viewsAction, appAction],
 				"list my cloud apps",
 			),
-		).toEqual(["VIEWS", "APP"]);
+		).toEqual(["VIEWS"]);
+	});
+
+	it("keeps cloud lifecycle/mutation asks off the deterministic cloud candidate (#17363)", () => {
+		for (const message of [
+			"launch my cloud app",
+			"delete my cloud app",
+			"open the settings for my cloud app",
+			"create a cloud app for my portfolio",
+			"deploy my cloud app",
+			"withdraw earnings from my cloud app",
+		]) {
+			const names = inferDirectCurrentRequestCandidateActions(
+				[viewsAction, appAction, cloudAppsAction],
+				message,
+			);
+			expect(names).not.toContain("LIST_CLOUD_APPS");
+			expect(names).not.toContain("APP");
+		}
+	});
+
+	it("keeps compound/multi-tool cloud turns with the full planner (#17363)", () => {
+		for (const message of [
+			"list my cloud apps and then deploy the first one",
+			"list my cloud apps; delete the oldest one",
+			"show my cloud apps. Then launch acme.",
+			"list my cloud apps and also check the deploy status",
+		]) {
+			const names = inferDirectCurrentRequestCandidateActions(
+				[viewsAction, appAction, cloudAppsAction],
+				message,
+			);
+			expect(names).not.toContain("LIST_CLOUD_APPS");
+			expect(names).not.toContain("APP");
+		}
 	});
 
 	it("resolves the cloud action by simile when the canonical name differs", () => {

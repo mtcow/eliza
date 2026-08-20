@@ -1515,13 +1515,82 @@ const CLOUD_APP_QUALIFIER_TOKENS: ReadonlySet<string> = new Set<string>([
 	"HOSTED",
 ]);
 
+// Lifecycle/mutation vocabulary that disqualifies the cloud-apps INVENTORY
+// candidate: launch/open, delete, create/deploy, settings, and money/domain
+// operations belong to their own gated actions and must go through the full
+// planner, never a deterministic read hint (#17363). Singular-normalized.
+const CLOUD_APP_LIFECYCLE_TOKENS: ReadonlySet<string> = new Set<string>([
+	"LAUNCH",
+	"OPEN",
+	"START",
+	"RUN",
+	"RESTART",
+	"STOP",
+	"CLOSE",
+	"QUIT",
+	"KILL",
+	"DELETE",
+	"REMOVE",
+	"UNINSTALL",
+	"DESTROY",
+	"CREATE",
+	"BUILD",
+	"MAKE",
+	"DEPLOY",
+	"REDEPLOY",
+	"PUBLISH",
+	"UPDATE",
+	"EDIT",
+	"RENAME",
+	"CONFIGURE",
+	"CONFIG",
+	"SETTING",
+	"ROLLBACK",
+	"WITHDRAW",
+	"REGENERATE",
+	"ROTATE",
+	"MONETIZE",
+	"MONETIZATION",
+	"DOMAIN",
+	"BACKUP",
+]);
+
+// Clause boundaries that mark a compound/multi-tool turn. A deterministic
+// inventory hint may only claim a message that is one self-contained clause;
+// anything joined by these separators keeps the full planner in charge.
+const CLOUD_APP_CLAUSE_BOUNDARY_PATTERN =
+	/[;.!?]|\bthen\b|\b(?:and|also|plus)\s+(?:then\s+)?(?:launch|open|start|run|restart|stop|close|quit|kill|delete|remove|uninstall|destroy|create|build|make|deploy|redeploy|publish|update|edit|rename|configure|rollback|withdraw|regenerate|rotate|monetize|backup|show|list|check|get|tell)\b|\bafter\s+that\b/iu;
+
+// Read-shaped inventory phrasing: the request asks WHAT hosted apps exist, not
+// to do anything to one of them.
+const CLOUD_APP_INVENTORY_READ_PATTERN =
+	/\b(?:list|show|see|view|enumerate|check|get|give\s+me|tell\s+me|what|which|how\s+many|do\s+i\s+have|have\s+i\s+got)\b/iu;
+
+/**
+ * True only for a single-clause, explicitly cloud-qualified inventory read
+ * ("list my cloud apps", "what apps do I have deployed on eliza cloud").
+ * Lifecycle/mutation verbs and compound turns disqualify the message so the
+ * full planner keeps arbitration (#17363: "delete my cloud app" and "list my
+ * cloud apps and deploy the first one" were hijacked into LIST_CLOUD_APPS).
+ */
+function looksLikeCloudAppInventoryRequest(messageText: string): boolean {
+	const trimmed = messageText.trim().replace(/[.!?]+\s*$/u, "");
+	if (CLOUD_APP_CLAUSE_BOUNDARY_PATTERN.test(trimmed)) return false;
+	if (!CLOUD_APP_INVENTORY_READ_PATTERN.test(trimmed)) return false;
+	const tokens = tokenizeActionMetadata(trimmed).map(normalizeSingularToken);
+	return !tokens.some((token) => CLOUD_APP_LIFECYCLE_TOKENS.has(token));
+}
+
 // Resolve the app action an app-shaped message targets. A cloud qualifier next
 // to the APP token pins the ask to the user's hosted Eliza Cloud apps, where
 // the local app-control action is wrong by its own routing contract — without
 // this the cloud-apps action is never on the planner surface and the local APP
-// action wins by forfeit. Falls back to the local app-control surface when no
-// cloud-apps action is registered, so those runtimes keep their previous
-// candidates.
+// action wins by forfeit. The cloud candidate is offered only for a
+// single-clause inventory read; cloud lifecycle/mutation and compound turns
+// yield NO app candidate so the full planner arbitrates. A cloud-qualified
+// message never degrades to the local-device APP action — with no cloud-apps
+// action registered the correct answer is an honest capability gap, not the
+// installed-app list (#17363).
 function findAppActionNameForAppRequest(
 	actions: ReadonlyArray<Pick<Action, "name" | "similes">>,
 	messageText: string,
@@ -1533,11 +1602,8 @@ function findAppActionNameForAppRequest(
 		return undefined;
 	}
 	if (tokens.some((token) => CLOUD_APP_QUALIFIER_TOKENS.has(token))) {
-		const cloudAppsAction = findAvailableActionName(
-			actions,
-			CLOUD_APPS_ACTION_NAMES,
-		);
-		if (cloudAppsAction) return cloudAppsAction;
+		if (!looksLikeCloudAppInventoryRequest(messageText)) return undefined;
+		return findAvailableActionName(actions, CLOUD_APPS_ACTION_NAMES);
 	}
 	return findAvailableActionName(actions, APP_CONTROL_ACTION_NAMES);
 }
