@@ -80,6 +80,7 @@ import {
 import type { SharedRuntimeAgent } from "./shared-runtime-agent";
 import { SharedRuntimeCacheWarmingError, SharedTurnConflictError } from "./shared-runtime-errors";
 import {
+  canonicalizeSharedRuntimeHistoryMessages,
   MAX_HISTORY_MESSAGES,
   sharedPublicWebGrounding,
   sharedRuntimeModelHistoryMessages,
@@ -663,7 +664,7 @@ async function loadHistory(
     : await import("../../../db/repositories/shared-runtime-history").then(
         ({ sharedRuntimeHistoryRepository }) => sharedRuntimeHistoryRepository.get(agentId, roomId),
       );
-  return history.filter(isTurn);
+  return canonicalizeSharedRuntimeHistoryMessages(history.filter(isTurn));
 }
 
 async function mergeHistory(

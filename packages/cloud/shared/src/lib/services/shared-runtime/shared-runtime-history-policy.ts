@@ -212,22 +212,22 @@ function groundingWords(value: string): Set<string> {
   );
 }
 
-function selectedGroundingIndices(
+type SelectedGrounding = {
+  index: number;
+  grounding: SharedRuntimePublicGrounding;
+  status: "available" | "unavailable" | "fresh_search_required";
+};
+
+function selectedGrounding(
   history: SharedRuntimeHistoryMessageLike[],
   queryText: string,
   now: number,
-): Set<number> {
+): SelectedGrounding | undefined {
   const query = groundingWords(queryText);
   const ranked = history.flatMap((message, index) => {
     const grounding =
       message.role === "assistant" ? parseSharedPublicWebGrounding(message.grounding) : undefined;
     if (!grounding) return [];
-    if (
-      grounding.observedAt < now - MAX_PUBLIC_WEB_GROUNDING_AGE_MS ||
-      grounding.observedAt > now + MAX_PUBLIC_WEB_GROUNDING_FUTURE_SKEW_MS
-    ) {
-      return [];
-    }
     let precedingUserQuery = "";
     for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
       if (history[cursor].role !== "user") continue;
@@ -248,7 +248,29 @@ function selectedGroundingIndices(
     (left, right) =>
       right.grounding.observedAt - left.grounding.observedAt || right.index - left.index,
   )[0];
-  return latest?.grounding.kind === "web_search" ? new Set([latest.index]) : new Set();
+  if (!latest) return undefined;
+  if (latest.grounding.kind === "web_search_unavailable") {
+    return { ...latest, status: "unavailable" };
+  }
+  if (
+    latest.grounding.observedAt < now - MAX_PUBLIC_WEB_GROUNDING_AGE_MS ||
+    latest.grounding.observedAt > now + MAX_PUBLIC_WEB_GROUNDING_FUTURE_SKEW_MS
+  ) {
+    return { ...latest, status: "fresh_search_required" };
+  }
+  return { ...latest, status: "available" };
+}
+
+function groundingAuthorityMarker(selection: SelectedGrounding): ModelMessage {
+  return {
+    role: "system",
+    content: JSON.stringify({
+      type: "public_web_search_authority",
+      status: selection.status,
+      query: selection.grounding.query,
+      policy: "do_not_use_prior_assistant_web_claims",
+    }),
+  };
 }
 
 /** Projects selected evidence as native tool results while keeping assistant prose separate. */
@@ -257,12 +279,13 @@ export function sharedRuntimeModelHistoryMessages(
   queryText: string,
   now = Date.now(),
 ): ModelMessage[] {
-  const selected = selectedGroundingIndices(history, queryText, now);
+  const selected = selectedGrounding(history, queryText, now);
   const messages: ModelMessage[] = [];
   for (const [index, message] of history.entries()) {
-    const grounding = selected.has(index)
-      ? parseSharedPublicWebGrounding(message.grounding)
-      : undefined;
+    const grounding =
+      selected?.index === index && selected.status === "available"
+        ? parseSharedPublicWebGrounding(message.grounding)
+        : undefined;
     if (grounding?.kind === "web_search") {
       const toolCallId = `persisted-web-${stringToUuid(`shared:${messageIdentity(message)}`)}`;
       messages.push({
@@ -289,6 +312,9 @@ export function sharedRuntimeModelHistoryMessages(
       });
     }
     messages.push({ role: message.role, content: sharedRuntimeModelHistoryContent(message) });
+    if (selected?.index === index && selected.status !== "available") {
+      messages.push(groundingAuthorityMarker(selected));
+    }
   }
   return messages;
 }
@@ -321,6 +347,25 @@ function isPersistedMessage(value: unknown): value is SharedRuntimeHistoryMessag
     typeof (value as { content?: unknown }).content === "string" &&
     (value as { content: string }).content.trim().length > 0
   );
+}
+
+/** Removes invalid grounding and rewrites accepted grounding to its bounded canonical shape. */
+export function canonicalizeSharedRuntimeHistoryMessage<T extends SharedRuntimeHistoryMessageLike>(
+  message: T,
+): T {
+  const { grounding: _untrustedGrounding, ...withoutGrounding } = message;
+  if (message.role !== "assistant") return withoutGrounding as T;
+  const grounding = parseSharedPublicWebGrounding(message.grounding);
+  return (grounding ? { ...withoutGrounding, grounding } : withoutGrounding) as T;
+}
+
+/** Validates and canonicalizes every message crossing a durable history boundary. */
+export function canonicalizeSharedRuntimeHistoryMessages<T extends SharedRuntimeHistoryMessageLike>(
+  messages: T[],
+): T[] {
+  return messages
+    .filter(isPersistedMessage)
+    .map((message) => canonicalizeSharedRuntimeHistoryMessage(message as T));
 }
 
 function messageIdentity(message: SharedRuntimeHistoryMessageLike): string {
@@ -360,7 +405,7 @@ export function selectSharedRuntimeContext<T extends SharedRuntimeHistoryMessage
   queryText: string,
   limit = MAX_HISTORY_MESSAGES,
 ): T[] {
-  const valid = history.filter(isPersistedMessage);
+  const valid = canonicalizeSharedRuntimeHistoryMessages(history);
   if (valid.length <= limit) return valid;
 
   const recentStart = Math.max(0, valid.length - Math.min(RECENT_CONTEXT_MESSAGES, limit));
@@ -436,8 +481,9 @@ export function mergeSharedRuntimeHistoryMessages<T extends SharedRuntimeHistory
   const merged = new Map<string, T>();
   for (const message of [...current, ...incoming]) {
     if (!isPersistedMessage(message)) continue;
-    const key = messageIdentity(message);
-    merged.set(key, chooseMergedMessage(merged.get(key), message));
+    const canonical = canonicalizeSharedRuntimeHistoryMessage(message);
+    const key = messageIdentity(canonical);
+    merged.set(key, chooseMergedMessage(merged.get(key), canonical));
   }
   return [...merged.values()].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0)).slice(-limit);
 }

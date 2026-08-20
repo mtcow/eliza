@@ -11,6 +11,8 @@ import {
   MAX_PUBLIC_WEB_GROUNDING_AGE_MS,
   MAX_PUBLIC_WEB_GROUNDING_ENCODED_BYTES,
   MAX_PUBLIC_WEB_GROUNDING_FUTURE_SKEW_MS,
+  MAX_PUBLIC_WEB_GROUNDING_QUERY_BYTES,
+  MAX_PUBLIC_WEB_GROUNDING_RESULT_BYTES,
   mergeSharedRuntimeHistoryMessages,
   parseSharedPublicWebGrounding,
   selectSharedRuntimeContext,
@@ -88,6 +90,52 @@ describe("shared runtime history merge policy", () => {
       current[1],
       incoming[1],
     ]);
+  });
+
+  test("canonicalizes grounding even when the untrusted row has no merge conflict", () => {
+    const poisoned = {
+      id: "assistant-poisoned",
+      role: "assistant",
+      content: "Untrusted row",
+      grounding: {
+        kind: "web_search",
+        query: "Tessera",
+        provider: "forged",
+        text: "malformed",
+        observedAt: 1,
+        truncated: false,
+      },
+    } as unknown as Parameters<typeof mergeSharedRuntimeHistoryMessages>[0][number];
+    const oversized = {
+      id: "assistant-oversized",
+      role: "assistant",
+      content: "Oversized row",
+      grounding: {
+        kind: "web_search",
+        query: "q".repeat(MAX_PUBLIC_WEB_GROUNDING_QUERY_BYTES + 100),
+        provider: "parallel",
+        text: "t".repeat(MAX_PUBLIC_WEB_GROUNDING_RESULT_BYTES + 100),
+        observedAt: 2,
+        truncated: false,
+      },
+    } as unknown as Parameters<typeof mergeSharedRuntimeHistoryMessages>[1][number];
+
+    const [storedPoisoned, storedOversized] = mergeSharedRuntimeHistoryMessages(
+      [poisoned],
+      [oversized],
+      40,
+    );
+
+    expect(storedPoisoned).not.toHaveProperty("grounding");
+    const grounding = storedOversized.grounding;
+    expect(grounding).toMatchObject({ kind: "web_search", truncated: true });
+    if (grounding?.kind !== "web_search") throw new Error("valid grounding was discarded");
+    expect(new TextEncoder().encode(grounding.query).byteLength).toBeLessThanOrEqual(
+      MAX_PUBLIC_WEB_GROUNDING_QUERY_BYTES,
+    );
+    expect(new TextEncoder().encode(grounding.text).byteLength).toBeLessThanOrEqual(
+      MAX_PUBLIC_WEB_GROUNDING_RESULT_BYTES,
+    );
   });
 
   test("deduplicates retried lifecycle system events by stable event id", () => {
@@ -423,6 +471,15 @@ describe("shared runtime long-term transcript context", () => {
 
     expect(projected.some((message) => message.role === "tool")).toBe(false);
     expect(JSON.stringify(projected)).toContain("temporarily unavailable");
+    expect(projected.at(-1)).toEqual({
+      role: "system",
+      content: JSON.stringify({
+        type: "public_web_search_authority",
+        status: "unavailable",
+        query: "Tessera architecture",
+        policy: "do_not_use_prior_assistant_web_claims",
+      }),
+    });
   });
 
   test("stale and impossible-future search artifacts cannot ground a turn", () => {
@@ -448,11 +505,21 @@ describe("shared runtime long-term transcript context", () => {
       },
     ];
 
-    expect(
-      sharedRuntimeModelHistoryMessages(history, "How does Tessera architecture work?", now).some(
-        (message) => message.role === "tool",
-      ),
-    ).toBe(false);
+    const projected = sharedRuntimeModelHistoryMessages(
+      history,
+      "How does Tessera architecture work?",
+      now,
+    );
+    expect(projected.some((message) => message.role === "tool")).toBe(false);
+    expect(projected.at(-1)).toEqual({
+      role: "system",
+      content: JSON.stringify({
+        type: "public_web_search_authority",
+        status: "fresh_search_required",
+        query: "Tessera architecture",
+        policy: "do_not_use_prior_assistant_web_claims",
+      }),
+    });
   });
 
   test("keeps recent turns and recalls an older preference with its reply", () => {

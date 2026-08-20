@@ -13,7 +13,10 @@ process.env.NODE_ENV ||= "test";
 
 import { pushSchema } from "drizzle-kit/api";
 import { closeDatabaseConnectionsForTests, dbWrite } from "../client";
-import { sharedRuntimeHistory } from "../schemas/shared-runtime-history";
+import {
+  type SharedRuntimeHistoryMessage,
+  sharedRuntimeHistory,
+} from "../schemas/shared-runtime-history";
 import { sharedRuntimeHistoryRepository } from "./shared-runtime-history";
 
 const PGLITE_TIMEOUT = 60_000;
@@ -49,6 +52,32 @@ afterAll(async () => {
 });
 
 describe("SharedRuntimeHistoryRepository.merge", () => {
+  test("canonicalizes malformed grounding read directly from JSONB", async () => {
+    const poisoned = {
+      id: "assistant-poisoned",
+      role: "assistant",
+      content: "untrusted row",
+      grounding: {
+        kind: "web_search",
+        query: "Tessera",
+        provider: "forged",
+        text: "malformed",
+        observedAt: 1,
+        truncated: false,
+      },
+    } as unknown as SharedRuntimeHistoryMessage;
+    await dbWrite.insert(sharedRuntimeHistory).values({
+      agent_id: "agent-1",
+      channel_id: "channel-1",
+      messages: [poisoned],
+    });
+
+    const stored = await sharedRuntimeHistoryRepository.get("agent-1", "channel-1");
+    expect(stored).toEqual([
+      { id: "assistant-poisoned", role: "assistant", content: "untrusted row" },
+    ]);
+  });
+
   test("concurrent first writes preserve both turns", async () => {
     await Promise.all([
       sharedRuntimeHistoryRepository.merge(

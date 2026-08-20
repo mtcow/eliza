@@ -1,6 +1,9 @@
 // Persists shared runtime history records for cloud services through the shared DB boundary.
 import { and, eq, gt } from "drizzle-orm";
-import { mergeSharedRuntimeHistoryMessages } from "../../lib/services/shared-runtime/shared-runtime-history-policy";
+import {
+  canonicalizeSharedRuntimeHistoryMessages,
+  mergeSharedRuntimeHistoryMessages,
+} from "../../lib/services/shared-runtime/shared-runtime-history-policy";
 import { dbRead, dbWrite } from "../client";
 import {
   type SharedRuntimeHistoryMessage,
@@ -25,7 +28,9 @@ export class SharedRuntimeHistoryRepository {
         eq(sharedRuntimeHistory.channel_id, channelId),
       ),
     });
-    return Array.isArray(row?.messages) ? row.messages : [];
+    return canonicalizeSharedRuntimeHistoryMessages(
+      Array.isArray(row?.messages) ? row.messages : [],
+    );
   }
 
   /**

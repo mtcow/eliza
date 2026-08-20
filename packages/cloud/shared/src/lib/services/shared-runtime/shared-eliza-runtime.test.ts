@@ -1163,7 +1163,7 @@ describe("Shared Eliza Workerd runtime", () => {
     expect(encodedRequest).toContain('"role":"tool"');
   });
 
-  test("does not hydrate superseded grounding after the latest search is unavailable", async () => {
+  test("projects explicit unavailable authority into the genuine model request", async () => {
     const observedAt = Date.now();
     const modelRequests: Array<Record<string, unknown>> = [];
     globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
@@ -1187,14 +1187,12 @@ describe("Shared Eliza Workerd runtime", () => {
                     name: "HANDLE_RESPONSE",
                     arguments: JSON.stringify({
                       shouldRespond: "RESPOND",
-                      thought:
-                        "The latest search was unavailable, so old claims are not authority.",
+                      thought: "Deterministic transport stub response.",
                       contexts: ["simple"],
                       intents: [],
                       candidateActionNames: [],
                       requiresTool: false,
-                      replyText:
-                        "The latest web search was unavailable, so I cannot verify that yet.",
+                      replyText: "Acknowledged.",
                       replyEffectStatus: "none",
                       facts: [],
                       relationships: [],
@@ -1212,7 +1210,7 @@ describe("Shared Eliza Workerd runtime", () => {
     }) as typeof fetch;
 
     const { runSharedAgentTurn } = await import("./run-shared-agent-turn");
-    const result = await runSharedAgentTurn({
+    await runSharedAgentTurn({
       character: { name: "Shared Eliza", system: "You are Eliza.", model: "gemma-4-31b" },
       history: [
         {
@@ -1244,12 +1242,14 @@ describe("Shared Eliza Workerd runtime", () => {
       },
     });
 
-    expect(result.reply).toContain("cannot verify");
     expect(modelRequests).toHaveLength(1);
     const encodedRequest = JSON.stringify(modelRequests[0]);
     expect(encodedRequest).not.toContain("untrusted_public_web_search_result");
     expect(encodedRequest).not.toContain("OBSOLETE");
     expect(encodedRequest).toContain("temporarily unavailable");
+    expect(encodedRequest).toContain("public_web_search_authority");
+    expect(encodedRequest).toContain('"status":"unavailable"');
+    expect(encodedRequest).toContain("do_not_use_prior_assistant_web_claims");
   });
 
   test("plans GENERATE_MEDIA through the genuine runtime and lands a channel-safe artifact", async () => {
