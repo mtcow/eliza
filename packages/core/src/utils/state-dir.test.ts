@@ -104,8 +104,20 @@ describe("getElizaNamespace", () => {
 describe("getOptimizationRootDir", () => {
 	it("preserves an explicit optimization directory", () => {
 		expect(getOptimizationRootDir("/tmp/optimization")).toBe(
-			"/tmp/optimization",
+			resolve("/tmp/optimization"),
 		);
+	});
+
+	it("expands a leading ~ in an explicit optimization directory", () => {
+		const result = getOptimizationRootDir("~/optimization");
+		expect(result.endsWith(`${sep}optimization`)).toBe(true);
+		expect(isAbsolute(result)).toBe(true);
+	});
+
+	it("falls back to the state-dir optimization root for whitespace-only input", () => {
+		const result = getOptimizationRootDir("   ");
+		expect(result.endsWith(`${sep}optimization`)).toBe(true);
+		expect(isAbsolute(result)).toBe(true);
 	});
 });
 
@@ -139,6 +151,11 @@ describe("resolveUserPath", () => {
 
 	it("resolves a relative path to absolute", () => {
 		expect(resolveUserPath("relative")).toBe(join(process.cwd(), "relative"));
+	});
+
+	it("returns an empty string for nullish input without throwing", () => {
+		expect(resolveUserPath(null)).toBe("");
+		expect(resolveUserPath(undefined)).toBe("");
 	});
 });
 
