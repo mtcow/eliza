@@ -1048,8 +1048,9 @@ function writeIfChanged(target, content) {
  * cache for this ABI, stage them into the assets dir:
  *
  *   - Move existing `<ldName>` (the Alpine-extracted real loader) to
- *     `<ldName>.real`. We freshen this on every run so the wrapper
- *     always points at an up-to-date loader.
+ *     `<ldName>.real`. Relocation happens once, keyed off the ELF image
+ *     kind: later passes leave `.real` untouched so repeated staging
+ *     cannot overwrite the real loader with the wrapper.
  *   - Drop our compiled `loader-wrap` in as `<ldName>`.
  *   - Drop `libsigsys-handler.so` next to it.
  *
@@ -1158,6 +1159,68 @@ export function autoProvisionSeccompShim({
   return fs.existsSync(path.join(abiCacheDir, "libsigsys-handler.so"));
 }
 
+/** ELF image kinds we can tell apart by the on-disk header alone. */
+export type ElfImageKind =
+  | "shared-object"
+  | "executable"
+  | "unknown"
+  | "missing";
+
+// ELF header constants used by classifyElfImage (offset 4/5/16 of the file).
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]); // "\x7fELF"
+const ELF_CLASS_32 = 1;
+const ELF_CLASS_64 = 2;
+const ELF_DATA_LSB = 1;
+const ELF_DATA_MSB = 2;
+const ET_EXEC = 2; // executable image — our static loader-wrap
+const ET_DYN = 3; // shared object — the Alpine musl loader
+
+/**
+ * Classify a staged loader file from its ELF header. The Alpine musl loader is
+ * a shared object (`ET_DYN`); our `loader-wrap` is a static executable
+ * (`ET_EXEC`). `missing` means the path does not exist; `unknown` means the
+ * bytes are not a well-formed ELF whose type we recognize.
+ *
+ * Exported for testing.
+ */
+export function classifyElfImage(filePath: string): ElfImageKind {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, "r");
+  } catch {
+    return "missing";
+  }
+  try {
+    const header = Buffer.alloc(18);
+    const read = fs.readSync(fd, header, 0, header.length, 0);
+    if (read < 18 || !header.subarray(0, 4).equals(ELF_MAGIC)) return "unknown";
+    if (header[4] !== ELF_CLASS_32 && header[4] !== ELF_CLASS_64) {
+      return "unknown";
+    }
+    const dataEncoding = header[5];
+    if (dataEncoding !== ELF_DATA_LSB && dataEncoding !== ELF_DATA_MSB) {
+      return "unknown";
+    }
+    const eType =
+      dataEncoding === ELF_DATA_LSB
+        ? header.readUInt16LE(16)
+        : header.readUInt16BE(16);
+    if (eType === ET_EXEC) return "executable";
+    if (eType === ET_DYN) return "shared-object";
+    return "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // best-effort: a failed close does not change the classification
+      }
+    }
+  }
+}
+
 export function stageSeccompShimForAbi({
   androidAbi,
   ldName,
@@ -1191,31 +1254,43 @@ export function stageSeccompShimForAbi({
 
   let changes = 0;
 
-  // Detect whether the existing `<ldName>` is the Alpine loader (which
-  // we need to relocate to .real) or our wrapper (already in place from
-  // a prior run). The wrapper is a tiny static binary (~30 KB on
-  // x86_64-linux-musl); the Alpine loader is ~600 KB. A size check is
-  // good enough as a discriminator and avoids shelling out to readelf.
-  const ALPINE_LOADER_MIN_BYTES = 200 * 1024;
-  const stagedLoaderExists = fs.existsSync(stagedLoader);
-  const stagedLoaderIsAlpine =
-    stagedLoaderExists &&
-    fs.statSync(stagedLoader).size >= ALPINE_LOADER_MIN_BYTES;
+  // Detect whether the existing `<ldName>` is the Alpine musl loader (which we
+  // must relocate to `.real`) or our `loader-wrap` executable (already in place
+  // from a prior run). A byte-size threshold cannot separate them: the ARM64
+  // loader-wrap is ~1 MB while the Alpine loader is ~700 KB, so the wrapper
+  // cleared the old 200 KiB "looks like the loader" floor and a second staging
+  // pass copied the wrapper over `<ldName>.real`. The wrapper then exec'd a
+  // copy of itself instead of musl, and every launch died before bun started
+  // (#32511). Identify by ELF image kind instead — the Alpine loader is a
+  // shared object (ET_DYN), the wrapper a static executable (ET_EXEC) — which
+  // is exact and identical across ABIs.
+  const stagedLoaderKind = classifyElfImage(stagedLoader);
 
-  if (stagedLoaderIsAlpine) {
+  if (stagedLoaderKind === "shared-object") {
     // Move the Alpine loader to .real so the wrapper can exec it. Use
     // copy-then-delete so a partial failure still leaves a working .real.
     fs.copyFileSync(stagedLoader, stagedRealLoader);
     fs.rmSync(stagedLoader);
     changes += 1;
     log?.(`Renamed Alpine ${ldName} → ${ldName}.real for ${androidAbi}.`);
+  } else if (stagedLoaderKind === "unknown") {
+    // A file exists at `<ldName>` but it is neither our executable wrapper nor
+    // a shared-object loader. Refuse rather than overwrite a good `.real`
+    // loader with bytes we cannot identify — fail closed so a corrupted
+    // staging dir is repaired explicitly instead of shipping a broken loader.
+    throw new Error(
+      `[stage-android-agent] ${ldName} under ${abiAssetsDir} is not a recognized ` +
+        `ELF image (expected the Alpine shared-object loader or the staged ` +
+        `loader-wrap executable). Wipe the assets dir and re-run ` +
+        `stageAndroidAgentRuntime to repopulate it.`,
+    );
   } else if (!fs.existsSync(stagedRealLoader)) {
-    // Edge case: our wrapper is already in place but the .real
-    // loader is missing. The freshly-staged Alpine loader was
-    // overwritten with the wrapper before we could relocate it, or
-    // the cache dir was wiped. Refuse to stage a wrapper without a
-    // real loader to chain to — execve would fail at runtime with
-    // ENOENT and the agent would silently never come up.
+    // Edge case: our wrapper is already in place (or no loader is staged at
+    // all) but the .real loader is missing. The freshly-staged Alpine loader
+    // was overwritten with the wrapper before we could relocate it, or the
+    // cache dir was wiped. Refuse to stage a wrapper without a real loader to
+    // chain to — execve would fail at runtime with ENOENT and the agent would
+    // silently never come up.
     throw new Error(
       `[stage-android-agent] ${ldName}.real is missing under ${abiAssetsDir} ` +
         `but the wrapper is already in place. Wipe the assets dir and re-run ` +

@@ -14,6 +14,7 @@ import {
 
 import {
   __testables,
+  classifyElfImage,
   selectAndroidRuntimeTargets,
   stageSeccompShimForAbi,
 } from "./lib/stage-android-agent.ts";
@@ -678,4 +679,182 @@ test("runtime provenance deduplicates identical paths and refuses conflicting re
       ]),
     /Conflicting runtime provenance/,
   );
+});
+
+/**
+ * Build a header-valid ELF file with the given `e_type`. Only the fields
+ * `classifyElfImage` reads are populated; the rest is filler so the file has
+ * the size and shape of the real artifact under test.
+ */
+function writeElfImage(filePath, { eType, size, fill }) {
+  const buf = Buffer.alloc(size, fill);
+  buf.write("\x7fELF", 0, "latin1");
+  buf[4] = 2; // ELFCLASS64
+  buf[5] = 1; // ELFDATA2LSB
+  buf[6] = 1; // EV_CURRENT
+  buf.writeUInt16LE(eType, 16);
+  buf.writeUInt16LE(0xb7, 18); // e_machine (AArch64) — informational only
+  fs.writeFileSync(filePath, buf);
+  return buf;
+}
+
+function withNoAutoProvision(fn) {
+  const prior = process.env.ELIZA_SECCOMP_SHIM_NO_AUTOPROVISION;
+  process.env.ELIZA_SECCOMP_SHIM_NO_AUTOPROVISION = "1";
+  try {
+    return fn();
+  } finally {
+    if (prior === undefined) {
+      delete process.env.ELIZA_SECCOMP_SHIM_NO_AUTOPROVISION;
+    } else {
+      process.env.ELIZA_SECCOMP_SHIM_NO_AUTOPROVISION = prior;
+    }
+  }
+}
+
+test("classifyElfImage separates the shared-object loader from the executable wrapper", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "eliza-elf-kind-"));
+  try {
+    const loader = path.join(tmp, "ld-musl-aarch64.so.1");
+    writeElfImage(loader, { eType: 3, size: 700 * 1024, fill: 0xa1 });
+    assert.equal(classifyElfImage(loader), "shared-object");
+
+    const wrap = path.join(tmp, "loader-wrap");
+    writeElfImage(wrap, { eType: 2, size: 1024 * 1024, fill: 0x5a });
+    assert.equal(classifyElfImage(wrap), "executable");
+
+    // The old size fixture (256 KiB of zeros) is not a recognizable ELF.
+    const zeros = path.join(tmp, "zeros");
+    fs.writeFileSync(zeros, Buffer.alloc(256 * 1024));
+    assert.equal(classifyElfImage(zeros), "unknown");
+
+    // A big-endian shared object is still a shared object.
+    const bigEndian = Buffer.alloc(64);
+    bigEndian[0] = 0x7f;
+    bigEndian[1] = 0x45;
+    bigEndian[2] = 0x4c;
+    bigEndian[3] = 0x46;
+    bigEndian[4] = 1;
+    bigEndian[5] = 2; // ELFDATA2MSB
+    bigEndian[6] = 1;
+    bigEndian.writeUInt16BE(3, 16);
+    const bePath = path.join(tmp, "be.so.1");
+    fs.writeFileSync(bePath, bigEndian);
+    assert.equal(classifyElfImage(bePath), "shared-object");
+
+    assert.equal(classifyElfImage(path.join(tmp, "absent")), "missing");
+  } finally {
+    removePathRecursive(tmp);
+  }
+});
+
+test("re-staging the SIGSYS shim preserves the real musl loader bytes (#32511)", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "eliza-seccomp-restage-"));
+  try {
+    withNoAutoProvision(() => {
+      const ldName = "ld-musl-aarch64.so.1";
+      const abiAssetsDir = path.join(tmp, "assets", "arm64-v8a");
+      const cacheDir = path.join(tmp, "cache");
+      const abiCacheDir = path.join(cacheDir, "arm64-v8a");
+      fs.mkdirSync(abiAssetsDir, { recursive: true });
+      fs.mkdirSync(abiCacheDir, { recursive: true });
+
+      // Cached build artifacts. The real ARM64 loader-wrap is ~1 MB — far above
+      // the old 200 KiB size floor — so the wrapper itself used to be mistaken
+      // for the Alpine loader on a second staging pass.
+      const wrapBytes = writeElfImage(path.join(abiCacheDir, ldName), {
+        eType: 2, // ET_EXEC
+        size: 1024 * 1024,
+        fill: 0x5a,
+      });
+      fs.writeFileSync(path.join(abiCacheDir, "libsigsys-handler.so"), "shim");
+
+      // Fresh Alpine extraction: the real loader is a shared object (ET_DYN).
+      const loaderBytes = writeElfImage(path.join(abiAssetsDir, ldName), {
+        eType: 3, // ET_DYN
+        size: 700 * 1024,
+        fill: 0xa1,
+      });
+
+      const stage = () =>
+        stageSeccompShimForAbi({
+          androidAbi: "arm64-v8a",
+          ldName,
+          abiAssetsDir,
+          cacheDir,
+          log: () => {},
+        });
+
+      // First pass relocates the loader and stages the wrapper in its place.
+      assert.ok(stage() >= 1);
+      const realLoaderPath = path.join(abiAssetsDir, `${ldName}.real`);
+      assert.ok(
+        fs.readFileSync(realLoaderPath).equals(loaderBytes),
+        "first pass did not relocate the extracted loader",
+      );
+      assert.ok(
+        fs.readFileSync(path.join(abiAssetsDir, ldName)).equals(wrapBytes),
+      );
+
+      // Second pass is exactly what an incremental gradle build does.
+      assert.equal(stage(), 0);
+      assert.ok(
+        fs.readFileSync(realLoaderPath).equals(loaderBytes),
+        "re-staging overwrote the real musl loader with the wrapper",
+      );
+      assert.ok(
+        fs.readFileSync(path.join(abiAssetsDir, ldName)).equals(wrapBytes),
+      );
+
+      // A wrapper in place with the real loader gone still fails closed.
+      fs.rmSync(realLoaderPath);
+      assert.throws(stage, /\.real is missing under/);
+    });
+  } finally {
+    removePathRecursive(tmp);
+  }
+});
+
+test("unrecognized bytes at the loader path fail closed instead of clobbering .real", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "eliza-seccomp-unknown-"));
+  try {
+    withNoAutoProvision(() => {
+      const ldName = "ld-musl-aarch64.so.1";
+      const abiAssetsDir = path.join(tmp, "assets", "arm64-v8a");
+      const cacheDir = path.join(tmp, "cache");
+      const abiCacheDir = path.join(cacheDir, "arm64-v8a");
+      fs.mkdirSync(abiAssetsDir, { recursive: true });
+      fs.mkdirSync(abiCacheDir, { recursive: true });
+      writeElfImage(path.join(abiCacheDir, ldName), {
+        eType: 2,
+        size: 1024 * 1024,
+        fill: 0x5a,
+      });
+      fs.writeFileSync(path.join(abiCacheDir, "libsigsys-handler.so"), "shim");
+
+      const realLoaderPath = path.join(abiAssetsDir, `${ldName}.real`);
+      fs.writeFileSync(realLoaderPath, "good-real-loader");
+      // 256 KiB of zeros cleared the old size heuristic and was relocated over
+      // the real loader; the ELF identity check refuses it instead.
+      fs.writeFileSync(
+        path.join(abiAssetsDir, ldName),
+        Buffer.alloc(256 * 1024),
+      );
+
+      assert.throws(
+        () =>
+          stageSeccompShimForAbi({
+            androidAbi: "arm64-v8a",
+            ldName,
+            abiAssetsDir,
+            cacheDir,
+            log: () => {},
+          }),
+        /not a recognized ELF image/,
+      );
+      assert.equal(fs.readFileSync(realLoaderPath, "utf8"), "good-real-loader");
+    });
+  } finally {
+    removePathRecursive(tmp);
+  }
 });
