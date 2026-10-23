@@ -23,7 +23,9 @@
  * Opt-in: this provider is only selected when `ELIZA_VISION_OCR_BACKEND` is
  * `paddleocr`, so it never displaces a verified default provider. When PaddleOCR
  * (or python3) is absent it reports unavailable and `describe()` returns empty
- * blocks; it never throws, so the boot chain falls through cleanly.
+ * blocks, so the boot chain falls through cleanly; a run that fails, or that
+ * prints something other than the documented JSON, rejects with the reason
+ * instead of masquerading as a screen without text.
  *
  * NOTE (#9581): the JSON parser below is unit-tested without the engine (CI
  * needs no PaddleOCR install). End-to-end behaviour was verified against a real
@@ -132,20 +134,54 @@ function bboxFromQuad(
 }
 
 /**
+ * The wrapper's stdout could not be read as the documented JSON array. This is
+ * distinct from a frame with no text (the wrapper prints `[]` for that), and it
+ * has to reach the caller: a screen whose text was not read must not be
+ * reported as an empty screen.
+ */
+export class PaddleOcrUnreadableOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PaddleOcrUnreadableOutputError";
+  }
+}
+
+/** First non-empty slice of stdout, for the error message. */
+function previewPaddleOcrOutput(raw: string): string {
+  const flat = raw.replace(/\s+/g, " ").trim();
+  return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
+}
+
+/**
  * Parse the wrapper's stable JSON into typed detections. Pure — exported for
  * tests so the contract with `PADDLE_PY` has a single source of truth and CI
  * never needs a real PaddleOCR install. Drops entries without at least a
  * 3-point box (real detections are 4-point quads), blank text, or a non-finite
  * score.
+ *
+ * Throws `PaddleOcrUnreadableOutputError` when stdout is not the documented
+ * array. paddle's runtime prints model-download progress and log lines to
+ * stdout on the first run, and a half-written frame ends mid-object; reading
+ * either as "no text found" loses the OCR result without a trace.
  */
 export function parsePaddleOcrJson(raw: string): PaddleOcrDetection[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    return [];
+  } catch (err) {
+    throw new PaddleOcrUnreadableOutputError(
+      `PaddleOCR wrapper did not print the documented JSON array (${
+        err instanceof Error ? err.message : String(err)
+      }): "${previewPaddleOcrOutput(raw)}"`,
+    );
   }
-  if (!Array.isArray(parsed)) return [];
+  if (!Array.isArray(parsed)) {
+    throw new PaddleOcrUnreadableOutputError(
+      `PaddleOCR wrapper did not print the documented JSON array: "${previewPaddleOcrOutput(
+        raw,
+      )}"`,
+    );
+  }
   const dets: PaddleOcrDetection[] = [];
   for (const entry of parsed) {
     if (!entry || typeof entry !== "object") continue;
