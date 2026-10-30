@@ -79,31 +79,43 @@ function resolveCatalogPath(voiceModelsDir: string): string {
 	return path.join(voiceModelsDir, "profiles", "catalog.json");
 }
 
+/** The catalog of a voice-models dir that has no `catalog.json` yet. */
+function emptyCatalog(): VoiceProfileCatalog {
+	return {
+		version: CATALOG_SCHEMA_VERSION,
+		defaultProfileId: DEFAULT_PROFILE_ID,
+		profiles: [],
+	};
+}
+
 async function readCatalog(
 	voiceModelsDir: string,
 ): Promise<VoiceProfileCatalog> {
 	const catalogPath = resolveCatalogPath(voiceModelsDir);
-	if (!fs.existsSync(catalogPath)) {
-		return {
-			version: CATALOG_SCHEMA_VERSION,
-			defaultProfileId: DEFAULT_PROFILE_ID,
-			profiles: [],
-		};
-	}
+	let raw: string;
 	try {
-		const raw = await fsp.readFile(catalogPath, "utf8");
-		const parsed = JSON.parse(raw) as VoiceProfileCatalog;
-		if (!parsed.profiles) parsed.profiles = [];
-		if (!parsed.defaultProfileId) parsed.defaultProfileId = DEFAULT_PROFILE_ID;
-		parsed.version = CATALOG_SCHEMA_VERSION;
-		return parsed;
-	} catch {
-		return {
-			version: CATALOG_SCHEMA_VERSION,
-			defaultProfileId: DEFAULT_PROFILE_ID,
-			profiles: [],
-		};
+		raw = await fsp.readFile(catalogPath, "utf8");
+	} catch (cause) {
+		// error-policy:J3 A catalog that was never written is the normal first-run
+		// layout. Every other read failure (EACCES, EISDIR, EIO) is a real fault:
+		// the routes read → mutate → write this same file, so answering "no
+		// profiles" would rewrite the registered profiles away.
+		if ((cause as NodeJS.ErrnoException).code === "ENOENT")
+			return emptyCatalog();
+		throw new Error("Voice profile catalog could not be read", { cause });
 	}
+	let parsed: VoiceProfileCatalog;
+	try {
+		parsed = JSON.parse(raw) as VoiceProfileCatalog;
+	} catch (cause) {
+		// error-policy:J3 Malformed catalog JSON is corruption, not an empty
+		// catalog; rewriting it from an empty base would drop every entry.
+		throw new Error("Voice profile catalog is not valid JSON", { cause });
+	}
+	if (!parsed.profiles) parsed.profiles = [];
+	if (!parsed.defaultProfileId) parsed.defaultProfileId = DEFAULT_PROFILE_ID;
+	parsed.version = CATALOG_SCHEMA_VERSION;
+	return parsed;
 }
 
 async function writeCatalog(
