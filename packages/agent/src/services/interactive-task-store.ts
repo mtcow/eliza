@@ -73,8 +73,12 @@ function readable(document: unknown): boolean {
   try {
     validateInteractiveTask(parse(document));
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // Only a record this build cannot read is a version difference; a torn row
+    // or a storage failure is corruption and must not pass as one.
+    if (error instanceof ElizaError && error.code === "TASK_INVALID")
+      return false;
+    throw error;
   }
 }
 const UNRESOLVED = ["prepared", "dispatched", "unknown"];
