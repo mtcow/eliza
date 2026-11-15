@@ -2419,7 +2419,16 @@ function upsertInstalledModel(model: InstalledModelEntry): void {
       `iOS local-inference model path must live under ${localInferenceRootPath()}: ${model.path}`,
     );
   }
-  const existing = readInstalledModels().filter(
+  const snapshot = readInstalledModelsSnapshot();
+  if (!snapshot.ok) {
+    // Writing back the model list read from these bytes would replace every
+    // stored record with the empty registry the unreadable payload collapsed
+    // into, and report the download as recorded.
+    throw new Error(
+      `iOS local-inference registry is unreadable: ${snapshot.reason}`,
+    );
+  }
+  const existing = snapshot.models.filter(
     (entry) =>
       entry.id !== model.id &&
       entry.path !== model.path &&
@@ -2543,10 +2552,11 @@ function verifyInstalledModelFile(modelPath: string): VerifyResult {
     currentBytes,
   };
 }
-function readInstalledModels(): InstalledModelEntry[] {
-  const parsed = readJsonObjectFile(localInferenceRegistryPath());
+function registryInstalledModels(
+  parsed: Record<string, unknown>,
+): InstalledModelEntry[] {
   const rawModels = Array.isArray(parsed.models) ? parsed.models : [];
-  const fromRegistry = rawModels
+  return rawModels
     .map((entry): InstalledModelEntry | null => {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
         return null;
@@ -2585,16 +2595,76 @@ function readInstalledModels(): InstalledModelEntry[] {
       };
     })
     .filter((entry): entry is InstalledModelEntry => Boolean(entry));
+}
+function mergedInstalledModels(
+  registryModels: readonly InstalledModelEntry[],
+): InstalledModelEntry[] {
   const bundledModelsPath = bundledLocalInferenceModelsPath();
   const scanned = [
     ...(bundledModelsPath ? scanGgufFiles(bundledModelsPath) : []),
     ...scanGgufFiles(localInferenceModelsPath()),
   ];
   const byId = new Map<string, InstalledModelEntry>();
-  for (const model of [...scanned, ...fromRegistry]) {
+  for (const model of [...scanned, ...registryModels]) {
     byId.set(model.id, model);
   }
   return [...byId.values()];
+}
+function readInstalledModels(): InstalledModelEntry[] {
+  return mergedInstalledModels(
+    registryInstalledModels(readJsonObjectFile(localInferenceRegistryPath())),
+  );
+}
+/**
+ * The installed-model registry as read from disk, or the reason those bytes
+ * cannot be trusted.
+ *
+ * `readJsonObjectFile` answers `{}` for an absent, unparseable or
+ * wrong-shaped registry. That is fine for read-only callers, which fall back
+ * to scanning the models directory. `upsertInstalledModel` writes the file
+ * back, so it cannot use that answer: it would persist the damage as "these
+ * are the only installed models" and drop every stored record. Only ENOENT
+ * means "there is no registry yet".
+ */
+function readInstalledModelsSnapshot():
+  | { ok: true; models: InstalledModelEntry[] }
+  | { ok: false; reason: string } {
+  const registryPath = localInferenceRegistryPath();
+  let raw: string | null = null;
+  try {
+    raw = readFileSync(registryPath, "utf8");
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code !== "ENOENT") {
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+  let parsed: Record<string, unknown> = {};
+  if (raw !== null) {
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { ok: false, reason: "registry is not a JSON object" };
+    }
+    parsed = value as Record<string, unknown>;
+    if (parsed.models !== undefined && !Array.isArray(parsed.models)) {
+      return { ok: false, reason: "registry models field is not an array" };
+    }
+  }
+  return {
+    ok: true,
+    models: mergedInstalledModels(registryInstalledModels(parsed)),
+  };
 }
 function isEmbeddingModel(model: InstalledModelEntry): boolean {
   const lowered = model.id.toLowerCase();
@@ -3321,6 +3391,15 @@ async function runNativeModelDownload(
   let writer: ReturnType<typeof createWriteStream> | undefined;
   let received = 0;
   try {
+    // Fail before the bytes move: a registry that cannot be parsed can never be
+    // updated, so downloading a multi-gigabyte model first would only end in a
+    // failed job with the registry untouched.
+    const registry = readInstalledModelsSnapshot();
+    if (!registry.ok) {
+      throw new Error(
+        `iOS local-inference registry is unreadable: ${registry.reason}`,
+      );
+    }
     const response = await fetch(modelDownloadUrl(model), {
       redirect: "follow",
       signal: deadline.signal,
